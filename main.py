@@ -12,7 +12,7 @@ import io
 # -----------------------------
 # Konfiguracja
 # -----------------------------
-app = FastAPI(title="Bet Helper", version="1.3.1")
+app = FastAPI(title="Bet Helper", version="1.3.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -77,7 +77,7 @@ def kelly_fraction(prob: float, price: float, cap: float = 0.25, fraction: float
 def fetch_json(url: str, params: dict, cache_key: Optional[str] = None) -> dict:
     """
     GET z prostym cache + nagłówkami limitów.
-    Zwraca dict: {"ok": bool, "data": ..., "error": "..." }
+    Zwraca dict: {"ok": bool, "data": ..., "error": "...", "cached": bool }
     """
     if cache_key:
         cached = _cache_get(cache_key)
@@ -122,11 +122,11 @@ class Pick(BaseModel):
     type: str
 
 # -----------------------------
-# Endpointy
+# Endpointy API
 # -----------------------------
 @app.get("/")
 def home():
-    return {"message": "Bet Helper działa!"}
+    return {"message": "Bet Helper działa!", "have_api_key": bool(ODDS_API_KEY)}
 
 @app.get("/status")
 def status():
@@ -167,8 +167,8 @@ def picks(
     kelly_fraction_q: float = Query(0.5, ge=0.0, le=1.0, description="np. 0.5 = half Kelly"),
     kelly_cap: float = Query(0.25, ge=0.0, le=1.0),
     commission: float = Query(0.0, ge=0.0, le=0.1, description="Prowizja bukm. (0–0.1)"),
-    show: str = Query("value", regex="^(value|all)$"),
-    format: str = Query("json", regex="^(json|csv)$"),
+    show: str = Query("value", pattern="^(value|all)$"),
+    format: str = Query("json", pattern="^(json|csv)$"),
     stake_all: bool = Query(False, description="Jeśli True, pokazuj Kelly/stake również dla low_ev"),
     since_hours: int = Query(0, ge=0, description="Od teraz + Xh (filtr czasu)"),
     until_hours: int = Query(72, ge=1, description="Do teraz + Yh (filtr czasu)"),
@@ -182,8 +182,8 @@ def picks(
     - stake_all  → pokaż kelly/stake również dla low_ev
     """
     if not ODDS_API_KEY:
-        return [{"match": "", "selection": "", "price": 0, "bookmaker": None, "fair_prob": None,
-                 "ev": None, "kelly": None, "stake": None, "commence": None, "league": None, "type": "error"}]
+        # Zwracamy pustą listę (UI pokaże komunikat), a nie 500
+        return []
 
     url = f"{BASE}/sports/{sport}/odds"
     params = {
@@ -205,6 +205,7 @@ def picks(
     ck = f"odds:{sport}:{region}:{market}"
     res = fetch_json(url, params, cache_key=ck)
     if not res["ok"]:
+        # zwracamy komunikat jako „pozycja” – UI pokaże go w meta
         return [{"match": f"ERROR: {res['error']}", "selection": "", "price": 0, "bookmaker": None,
                  "fair_prob": None, "ev": None, "kelly": None, "stake": None, "commence": None,
                  "league": None, "type": "error"}]
@@ -376,9 +377,11 @@ def debug(
     }
 
 # -----------------------------
-# Prosty dashboard /ui
+# Prosty dashboard /ui (+ aliasy)
 # -----------------------------
 @app.get("/ui")
+@app.get("/dashboard")
+@app.get("/index")
 def ui():
     html = """
 <!doctype html>
@@ -481,6 +484,12 @@ async function loadPicks(){
   try{
     const res = await fetch('/picks?' + q.toString());
     const data = await res.json();
+
+    // komunikat przy braku klucza / błędzie
+    if(Array.isArray(data) && data.length===0){
+      document.getElementById('meta').innerText = 'Brak danych (czy ODDS_API_KEY jest ustawiony?)';
+    }
+
     const tb = document.querySelector('#tbl tbody');
     tb.innerHTML = '';
     let sumStake = 0;
@@ -494,9 +503,9 @@ async function loadPicks(){
       sumStake += parseFloat(stake)||0;
 
       tr.innerHTML = `
-        <td><div>${r.match}</div><small>${r.league||''}</small></td>
-        <td>${r.selection}</td>
-        <td class="right k">${r.price?.toFixed ? r.price.toFixed(2) : r.price}</td>
+        <td><div>${r.match||''}</div><small>${r.league||''}</small></td>
+        <td>${r.selection||''}</td>
+        <td class="right k">${(typeof r.price==='number') ? r.price.toFixed(2) : (r.price||'')}</td>
         <td>${r.bookmaker||''}</td>
         <td class="right">${fair}</td>
         <td class="right">${ev}</td>
@@ -539,3 +548,9 @@ loadPicks();
 </html>
     """.strip()
     return Response(content=html, media_type="text/html")
+
+
+# Lokalny run (nie używane na Railway, ale przydatne do dev)
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
