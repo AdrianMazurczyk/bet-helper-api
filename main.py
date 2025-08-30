@@ -138,3 +138,55 @@ def list_sports(region: str = "eu"):
         ]
     except Exception as e:
         return {"error": f"API error: {e}"}
+@app.get("/debug")
+def debug(
+    sport: str = Query("soccer_poland_ekstraklasa"),
+    region: str = Query("eu,uk"),
+):
+    if not ODDS_API_KEY:
+        return {"error": "Brak ODDS_API_KEY"}
+
+    url = f"{BASE}/sports/{sport}/odds"
+    params = {
+        "apiKey": ODDS_API_KEY,
+        "regions": region,
+        "markets": "h2h",
+        "oddsFormat": "decimal"
+    }
+
+    try:
+        r = requests.get(url, params=params, timeout=20)
+        r.raise_for_status()
+        events = r.json()
+    except Exception as e:
+        return {"error": f"API error: {e}"}
+
+    total_events = len(events)
+    with_h2h = 0
+    examples = []
+
+    for ev in events:
+        has = False
+        for b in ev.get("bookmakers", []):
+            for m in b.get("markets", []):
+                if m.get("key") == "h2h" and m.get("outcomes"):
+                    has = True
+                    break
+            if has:
+                break
+        if has:
+            with_h2h += 1
+            if len(examples) < 3:
+                examples.append({
+                    "match": f"{ev.get('home_team')} vs {ev.get('away_team')}",
+                    "bookmaker": b.get("title"),
+                    "outcomes": [o.get("name") for o in m.get("outcomes", [])]
+                })
+
+    return {
+        "sport": sport,
+        "region": region,
+        "events_from_api": total_events,
+        "events_with_h2h": with_h2h,
+        "examples": examples
+    }
