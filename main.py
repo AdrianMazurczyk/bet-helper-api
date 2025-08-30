@@ -9,10 +9,10 @@ from datetime import datetime, timedelta, timezone
 import csv
 import io
 
-# -----------------------------
+# ======================================
 # Konfiguracja
-# -----------------------------
-app = FastAPI(title="Bet Helper", version="1.3.2")
+# ======================================
+app = FastAPI(title="Bet Helper", version="1.4.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -30,9 +30,24 @@ CACHE_TTL_SECONDS = 60
 _cache: Dict[str, Tuple[float, dict]] = {}
 _last_limits: Dict[str, str] = {}
 
-# -----------------------------
+# Proste aliasy sportów (żeby wpisywać krócej)
+SPORT_ALIASES: Dict[str, str] = {
+    "epl": "soccer_epl",
+    "prem": "soccer_epl",
+    "premier_league": "soccer_epl",
+    "ekstraklasa": "soccer_poland_ekstraklasa",
+    "pl": "soccer_poland_ekstraklasa",
+    "poland": "soccer_poland_ekstraklasa",
+    "nba": "basketball_nba",
+    "laliga": "soccer_spain_la_liga",
+    "bundesliga": "soccer_germany_bundesliga",
+    "seriea": "soccer_italy_serie_a",
+    "ligue1": "soccer_france_ligue_one",
+}
+
+# ======================================
 # Narzędzia
-# -----------------------------
+# ======================================
 def _cache_get(key: str) -> Optional[dict]:
     now = time.time()
     item = _cache.get(key)
@@ -59,13 +74,7 @@ def normalize_3way(h, a, d):
     return scale(h), scale(a), scale(d)
 
 def kelly_fraction(prob: float, price: float, cap: float = 0.25, fraction: float = 0.5) -> float:
-    """
-    Kelly dla kursu dziesiętnego.
-    prob: fair probability po normalizacji
-    price: kurs
-    fraction: 0.5 = half Kelly (bezpieczniej)
-    cap: maks. część banku na jeden zakład
-    """
+    """Kelly dla kursu dziesiętnego (decimal)."""
     if not prob or not price or price <= 1.0:
         return 0.0
     b = price - 1.0
@@ -77,7 +86,7 @@ def kelly_fraction(prob: float, price: float, cap: float = 0.25, fraction: float
 def fetch_json(url: str, params: dict, cache_key: Optional[str] = None) -> dict:
     """
     GET z prostym cache + nagłówkami limitów.
-    Zwraca dict: {"ok": bool, "data": ..., "error": "...", "cached": bool }
+    Zwraca dict: {"ok": bool, "data": ..., "error": "..." }
     """
     if cache_key:
         cached = _cache_get(cache_key)
@@ -100,14 +109,17 @@ def fetch_json(url: str, params: dict, cache_key: Optional[str] = None) -> dict:
 
 def parse_iso(dt: str) -> Optional[datetime]:
     try:
-        # The Odds API zwraca UTC ISO
         return datetime.fromisoformat(dt.replace("Z", "+00:00"))
     except Exception:
         return None
 
-# -----------------------------
-# Modele (dla ładnego Swaggera)
-# -----------------------------
+def normalize_sport_key(s: str) -> str:
+    key = (s or "").strip().lower()
+    return SPORT_ALIASES.get(key, s)
+
+# ======================================
+# Modele (Swagger)
+# ======================================
 class Pick(BaseModel):
     match: str
     selection: str
@@ -121,12 +133,12 @@ class Pick(BaseModel):
     league: Optional[str] = None
     type: str
 
-# -----------------------------
-# Endpointy API
-# -----------------------------
+# ======================================
+# Endpointy
+# ======================================
 @app.get("/")
 def home():
-    return {"message": "Bet Helper działa!", "have_api_key": bool(ODDS_API_KEY)}
+    return {"message": "Bet Helper działa!"}
 
 @app.get("/status")
 def status():
@@ -155,10 +167,10 @@ def list_sports(all: bool = True):
 
 @app.get("/picks", response_model=List[Pick])
 def picks(
-    sport: str = Query("soccer_epl", description="np. soccer_epl, soccer_poland_ekstraklasa, basketball_nba"),
+    sport: str = Query("soccer_epl", description="np. soccer_epl / alias: epl, nba, ekstraklasa"),
     region: str = Query("eu,uk", description="np. eu, uk, us, au lub kombinacje: eu,uk"),
-    min_ev: float = Query(0.03, ge=0.0, description="Minimalne EV, np. 0.03 = 3%"),
-    limit: int = Query(20, ge=1, le=200),
+    min_ev: float = Query(0.0, ge=0.0, description="Minimalne EV (0 = pokaż wszystko)"),
+    limit: int = Query(200, ge=1, le=300),
     market: str = Query("h2h", description="Domyślnie h2h"),
     bookmakers: Optional[str] = Query(None, description="Lista buków przecinkiem, np. Unibet,Betfair"),
     min_price: Optional[float] = Query(None, ge=1.0),
@@ -167,11 +179,11 @@ def picks(
     kelly_fraction_q: float = Query(0.5, ge=0.0, le=1.0, description="np. 0.5 = half Kelly"),
     kelly_cap: float = Query(0.25, ge=0.0, le=1.0),
     commission: float = Query(0.0, ge=0.0, le=0.1, description="Prowizja bukm. (0–0.1)"),
-    show: str = Query("value", pattern="^(value|all)$"),
-    format: str = Query("json", pattern="^(json|csv)$"),
-    stake_all: bool = Query(False, description="Jeśli True, pokazuj Kelly/stake również dla low_ev"),
+    show: str = Query("all", regex="^(value|all)$"),
+    format: str = Query("json", regex="^(json|csv)$"),
+    stake_all: bool = Query(True, description="Pokazuj stawki także dla low_ev"),
     since_hours: int = Query(0, ge=0, description="Od teraz + Xh (filtr czasu)"),
-    until_hours: int = Query(72, ge=1, description="Do teraz + Yh (filtr czasu)"),
+    until_hours: int = Query(120, ge=1, description="Do teraz + Yh (filtr czasu)"),
 ):
     """
     Pobiera kursy H2H, wybiera najlepszy kurs HOME/AWAY/DRAW, normalizuje fair prob,
@@ -182,8 +194,10 @@ def picks(
     - stake_all  → pokaż kelly/stake również dla low_ev
     """
     if not ODDS_API_KEY:
-        # Zwracamy pustą listę (UI pokaże komunikat), a nie 500
-        return []
+        return [{"match": "", "selection": "", "price": 0, "bookmaker": None, "fair_prob": None,
+                 "ev": None, "kelly": None, "stake": None, "commence": None, "league": None, "type": "error"}]
+
+    sport = normalize_sport_key(sport)
 
     url = f"{BASE}/sports/{sport}/odds"
     params = {
@@ -205,7 +219,6 @@ def picks(
     ck = f"odds:{sport}:{region}:{market}"
     res = fetch_json(url, params, cache_key=ck)
     if not res["ok"]:
-        # zwracamy komunikat jako „pozycja” – UI pokaże go w meta
         return [{"match": f"ERROR: {res['error']}", "selection": "", "price": 0, "bookmaker": None,
                  "fair_prob": None, "ev": None, "kelly": None, "stake": None, "commence": None,
                  "league": None, "type": "error"}]
@@ -260,15 +273,13 @@ def picks(
         def build(sel: str, price: Optional[float], prob: Optional[float], book: Optional[str]) -> Optional[Dict]:
             if not price:
                 return None
-            # prowizja (np. 0.02 = 2%) obniża efektywny kurs
-            eff_price = price * (1.0 - commission)
+            eff_price = price * (1.0 - commission)  # prowizja
             ev_val = (prob * eff_price - 1.0) if prob else None
             kel = kelly_fraction(prob, eff_price, cap=kelly_cap, fraction=kelly_fraction_q) if prob else 0.0
-
             is_value = (ev_val is not None) and (ev_val >= min_ev)
             row_type = "value" if is_value else "low_ev"
 
-            # stake – zawsze licz, ale pokaż przy low_ev tylko gdy stake_all=True
+            # stake – zawsze licz, ale przy low_ev pokazuj tylko gdy stake_all=True
             stake_amt = round(kel * bankroll, 2) if kel and bankroll else 0.0
             if not is_value and not stake_all:
                 stake_amt = 0.0
@@ -299,7 +310,7 @@ def picks(
 
         out_rows.extend(cands)
 
-    # sortowanie: najpierw po typie (value > low_ev), potem EV desc, potem czas
+    # sortowanie: value > low_ev, EV desc, start asc
     def sort_key(x: Dict):
         t = 1 if x["type"] == "value" else 0
         ev = x["ev"] if x["ev"] is not None else -999
@@ -327,13 +338,14 @@ def picks(
 
 @app.get("/debug")
 def debug(
-    sport: str = Query("soccer_poland_ekstraklasa"),
+    sport: str = Query("soccer_epl"),
     region: str = Query("eu,uk"),
     market: str = Query("h2h")
 ):
     if not ODDS_API_KEY:
         return {"error": "Brak ODDS_API_KEY"}
 
+    sport = normalize_sport_key(sport)
     url = f"{BASE}/sports/{sport}/odds"
     params = {
         "apiKey": ODDS_API_KEY,
@@ -364,7 +376,7 @@ def debug(
             if len(examples) < 3:
                 examples.append({
                     "match": f"{ev.get('home_team')} vs {ev.get('away_team')}",
-                    "bookmakers": books[:25],  # krótko
+                    "bookmakers": books[:25],
                 })
 
     return {
@@ -376,12 +388,10 @@ def debug(
         "rate_limit_headers": _last_limits,
     }
 
-# -----------------------------
-# Prosty dashboard /ui (+ aliasy)
-# -----------------------------
+# ======================================
+# Prosty dashboard /ui
+# ======================================
 @app.get("/ui")
-@app.get("/dashboard")
-@app.get("/index")
 def ui():
     html = """
 <!doctype html>
@@ -418,24 +428,24 @@ small{color:var(--muted)}
 
   <div class="card">
     <div class="row">
-      <label>Sport<br><input id="sport" value="soccer_epl"/></label>
+      <label>Sport<br><input id="sport" value="soccer_epl" placeholder="np. epl, nba, ekstraklasa"/></label>
       <label>Region<br><input id="region" value="eu,uk"/></label>
       <label>Show<br>
         <select id="show">
-          <option value="value" selected>value</option>
-          <option value="all">all</option>
+          <option value="all" selected>all</option>
+          <option value="value">value</option>
         </select>
       </label>
-      <label>Min EV<br><input id="min_ev" type="number" step="0.001" value="0.02"/></label>
+      <label>Min EV<br><input id="min_ev" type="number" step="0.001" value="0"/></label>
       <label>Bankroll<br><input id="bankroll" type="number" step="1" value="1000"/></label>
       <label>Bookmakers (CSV)<br><input id="books" placeholder="np. Unibet,Betfair"/></label>
       <label>Min price<br><input id="min_price" type="number" step="0.01" placeholder=""/></label>
       <label>Max price<br><input id="max_price" type="number" step="0.01" placeholder=""/></label>
       <label>Since h<br><input id="since" type="number" value="0"/></label>
-      <label>Until h<br><input id="until" type="number" value="72"/></label>
-      <label>Commission<br><input id="comm" type="number" step="0.005" value="0.00"/></label>
+      <label>Until h<br><input id="until" type="number" value="120"/></label>
+      <label>Commission<br><input id="comm" type="number" step="0.005" value="0"/></label>
       <label>Stake all<br>
-        <select id="stake_all"><option value="false">false</option><option value="true">true</option></select>
+        <select id="stake_all"><option value="true" selected>true</option><option value="false">false</option></select>
       </label>
     </div>
     <div style="margin-top:10px" class="row">
@@ -475,7 +485,7 @@ async function loadPicks(){
   const minp = document.getElementById('min_price').value; if(minp) q.set('min_price', minp);
   const maxp = document.getElementById('max_price').value; if(maxp) q.set('max_price', maxp);
   q.set('since_hours', document.getElementById('since').value || '0');
-  q.set('until_hours', document.getElementById('until').value || '72');
+  q.set('until_hours', document.getElementById('until').value || '120');
   q.set('commission', document.getElementById('comm').value || '0');
   q.set('stake_all', document.getElementById('stake_all').value);
   q.set('limit','200');
@@ -484,12 +494,6 @@ async function loadPicks(){
   try{
     const res = await fetch('/picks?' + q.toString());
     const data = await res.json();
-
-    // komunikat przy braku klucza / błędzie
-    if(Array.isArray(data) && data.length===0){
-      document.getElementById('meta').innerText = 'Brak danych (czy ODDS_API_KEY jest ustawiony?)';
-    }
-
     const tb = document.querySelector('#tbl tbody');
     tb.innerHTML = '';
     let sumStake = 0;
@@ -503,9 +507,9 @@ async function loadPicks(){
       sumStake += parseFloat(stake)||0;
 
       tr.innerHTML = `
-        <td><div>${r.match||''}</div><small>${r.league||''}</small></td>
-        <td>${r.selection||''}</td>
-        <td class="right k">${(typeof r.price==='number') ? r.price.toFixed(2) : (r.price||'')}</td>
+        <td><div>${r.match}</div><small>${r.league||''}</small></td>
+        <td>${r.selection}</td>
+        <td class="right k">${r.price?.toFixed ? r.price.toFixed(2) : r.price}</td>
         <td>${r.bookmaker||''}</td>
         <td class="right">${fair}</td>
         <td class="right">${ev}</td>
@@ -534,7 +538,7 @@ function exportCSV(){
   const minp = document.getElementById('min_price').value; if(minp) q.set('min_price', minp);
   const maxp = document.getElementById('max_price').value; if(maxp) q.set('max_price', maxp);
   q.set('since_hours', document.getElementById('since').value || '0');
-  q.set('until_hours', document.getElementById('until').value || '72');
+  q.set('until_hours', document.getElementById('until').value || '120');
   q.set('commission', document.getElementById('comm').value || '0');
   q.set('stake_all', document.getElementById('stake_all').value);
   q.set('format','csv');
@@ -548,9 +552,3 @@ loadPicks();
 </html>
     """.strip()
     return Response(content=html, media_type="text/html")
-
-
-# Lokalny run (nie używane na Railway, ale przydatne do dev)
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
