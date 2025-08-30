@@ -12,7 +12,7 @@ import io
 # -----------------------------
 # Konfiguracja
 # -----------------------------
-app = FastAPI(title="Bet Helper", version="1.3.0")
+app = FastAPI(title="Bet Helper", version="1.3.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -374,3 +374,168 @@ def debug(
         "examples": examples,
         "rate_limit_headers": _last_limits,
     }
+
+# -----------------------------
+# Prosty dashboard /ui
+# -----------------------------
+@app.get("/ui")
+def ui():
+    html = """
+<!doctype html>
+<html lang="pl">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Bet Helper – Dashboard</title>
+<style>
+:root{--bg:#0f1220;--card:#171a2b;--text:#e9ecf1;--muted:#9aa3b2;--green:#27c28a;--gray:#2a2f45;--red:#f87171;}
+*{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--text);font:14px/1.4 system-ui, -apple-system, Segoe UI, Roboto, Ubuntu}
+.wrap{max-width:1100px;margin:32px auto;padding:0 16px}
+h1{margin:0 0 16px 0;font-size:22px}
+.card{background:var(--card);border-radius:14px;padding:16px;margin-bottom:16px;box-shadow:0 6px 20px rgba(0,0,0,.25)}
+.row{display:flex;gap:8px;flex-wrap:wrap}
+input,select{background:#0e1120;border:1px solid #2b324d;color:var(--text);border-radius:10px;padding:10px 12px;outline:none}
+button{background:#4251f5;border:none;color:#fff;border-radius:10px;padding:10px 14px;cursor:pointer}
+button.ghost{background:#252a43}
+.badge{padding:4px 8px;border-radius:999px;font-size:12px}
+.badge.value{background:rgba(39,194,138,.16);color:#27c28a}
+.badge.low{background:var(--gray);color:#c9d2e3}
+table{width:100%;border-collapse:collapse}
+th,td{padding:10px;border-bottom:1px solid #22263b;text-align:left;vertical-align:top}
+th{color:#c5cbe0;font-weight:600}
+small{color:var(--muted)}
+.k{white-space:nowrap}
+.right{text-align:right}
+.footer{display:flex;gap:12px;align-items:center;justify-content:space-between}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Bet Helper – Dashboard</h1>
+
+  <div class="card">
+    <div class="row">
+      <label>Sport<br><input id="sport" value="soccer_epl"/></label>
+      <label>Region<br><input id="region" value="eu,uk"/></label>
+      <label>Show<br>
+        <select id="show">
+          <option value="value" selected>value</option>
+          <option value="all">all</option>
+        </select>
+      </label>
+      <label>Min EV<br><input id="min_ev" type="number" step="0.001" value="0.02"/></label>
+      <label>Bankroll<br><input id="bankroll" type="number" step="1" value="1000"/></label>
+      <label>Bookmakers (CSV)<br><input id="books" placeholder="np. Unibet,Betfair"/></label>
+      <label>Min price<br><input id="min_price" type="number" step="0.01" placeholder=""/></label>
+      <label>Max price<br><input id="max_price" type="number" step="0.01" placeholder=""/></label>
+      <label>Since h<br><input id="since" type="number" value="0"/></label>
+      <label>Until h<br><input id="until" type="number" value="72"/></label>
+      <label>Commission<br><input id="comm" type="number" step="0.005" value="0.00"/></label>
+      <label>Stake all<br>
+        <select id="stake_all"><option value="false">false</option><option value="true">true</option></select>
+      </label>
+    </div>
+    <div style="margin-top:10px" class="row">
+      <button onclick="loadPicks()">Refresh</button>
+      <button class="ghost" onclick="exportCSV()">Export CSV</button>
+      <small id="meta"></small>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="footer"><div><b>Typy</b></div><div>Σ stake: <b id="sumStake">0</b></div></div>
+    <div style="overflow:auto">
+      <table id="tbl">
+        <thead>
+          <tr>
+            <th>Mecz</th><th>Pick</th><th class="right">Kurs</th><th>Buk</th>
+            <th class="right">Fair</th><th class="right">EV</th><th class="right">Kelly</th><th class="right">Stake</th>
+            <th>Start</th><th>Typ</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<script>
+async function loadPicks(){
+  const q = new URLSearchParams();
+  q.set('sport', document.getElementById('sport').value);
+  q.set('region', document.getElementById('region').value);
+  q.set('show', document.getElementById('show').value);
+  q.set('min_ev', document.getElementById('min_ev').value || '0');
+  q.set('bankroll', document.getElementById('bankroll').value || '1000');
+  const books = document.getElementById('books').value.trim();
+  if(books) q.set('bookmakers', books);
+  const minp = document.getElementById('min_price').value; if(minp) q.set('min_price', minp);
+  const maxp = document.getElementById('max_price').value; if(maxp) q.set('max_price', maxp);
+  q.set('since_hours', document.getElementById('since').value || '0');
+  q.set('until_hours', document.getElementById('until').value || '72');
+  q.set('commission', document.getElementById('comm').value || '0');
+  q.set('stake_all', document.getElementById('stake_all').value);
+  q.set('limit','200');
+
+  document.getElementById('meta').innerText = 'Loading…';
+  try{
+    const res = await fetch('/picks?' + q.toString());
+    const data = await res.json();
+    const tb = document.querySelector('#tbl tbody');
+    tb.innerHTML = '';
+    let sumStake = 0;
+    data.forEach(r=>{
+      const tr = document.createElement('tr');
+      const badge = r.type === 'value' ? '<span class="badge value">value</span>' : '<span class="badge low">low_ev</span>';
+      const ev = r.ev!=null ? r.ev.toFixed(3) : '';
+      const fair = r.fair_prob!=null ? r.fair_prob.toFixed(3) : '';
+      const kelly = r.kelly!=null ? r.kelly.toFixed(4) : '';
+      const stake = (r.stake||0).toFixed(2);
+      sumStake += parseFloat(stake)||0;
+
+      tr.innerHTML = `
+        <td><div>${r.match}</div><small>${r.league||''}</small></td>
+        <td>${r.selection}</td>
+        <td class="right k">${r.price?.toFixed ? r.price.toFixed(2) : r.price}</td>
+        <td>${r.bookmaker||''}</td>
+        <td class="right">${fair}</td>
+        <td class="right">${ev}</td>
+        <td class="right">${kelly}</td>
+        <td class="right">${stake}</td>
+        <td>${r.commence ? new Date(r.commence).toLocaleString() : ''}</td>
+        <td>${badge}</td>
+      `;
+      tb.appendChild(tr);
+    });
+    document.getElementById('sumStake').innerText = sumStake.toFixed(2);
+    document.getElementById('meta').innerText = `Łącznie: ${data.length} pozycji`;
+  }catch(e){
+    document.getElementById('meta').innerText = 'Błąd: ' + e;
+  }
+}
+
+function exportCSV(){
+  const q = new URLSearchParams();
+  q.set('sport', document.getElementById('sport').value);
+  q.set('region', document.getElementById('region').value);
+  q.set('show', document.getElementById('show').value);
+  q.set('min_ev', document.getElementById('min_ev').value || '0');
+  const books = document.getElementById('books').value.trim();
+  if(books) q.set('bookmakers', books);
+  const minp = document.getElementById('min_price').value; if(minp) q.set('min_price', minp);
+  const maxp = document.getElementById('max_price').value; if(maxp) q.set('max_price', maxp);
+  q.set('since_hours', document.getElementById('since').value || '0');
+  q.set('until_hours', document.getElementById('until').value || '72');
+  q.set('commission', document.getElementById('comm').value || '0');
+  q.set('stake_all', document.getElementById('stake_all').value);
+  q.set('format','csv');
+  q.set('limit','200');
+  window.location = '/picks?' + q.toString();
+}
+
+loadPicks();
+</script>
+</body>
+</html>
+    """.strip()
+    return Response(content=html, media_type="text/html")
