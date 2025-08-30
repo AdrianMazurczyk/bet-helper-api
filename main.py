@@ -11,10 +11,10 @@ import requests
 # -----------------------------
 app = FastAPI(title="Bet Helper", version="1.3.0")
 
-# CORS (dla frontendu)
+# CORS – w produkcji dodaj swoją domenę zamiast "*"
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],     # w produkcji wpisz swoją domenę
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -23,11 +23,9 @@ app.add_middleware(
 ODDS_API_KEY = os.getenv("ODDS_API_KEY")
 BASE = "https://api.the-odds-api.com/v4"
 
-# Prosty cache w pamięci
+# Prosty cache w pamięci, żeby nie klepać API co sekundę
 CACHE_TTL_SECONDS = 60
 _cache: Dict[str, Tuple[float, dict]] = {}
-
-# Ostatnie nagłówki dot. limitów zapytań
 _last_limits: Dict[str, str] = {}
 
 
@@ -50,26 +48,51 @@ def _cache_set(key: str, value: dict) -> None:
     _cache[key] = (time.time(), value)
 
 
+def fetch_json(url: str, params: dict, cache_key: Optional[str] = None) -> dict:
+    """
+    GET z prostym cache + zebraniem nagłówków limitów.
+    Zwraca dict: {"ok": bool, "data": ..., "error": "..." }
+    """
+    if cache_key:
+        cached = _cache_get(cache_key)
+        if cached is not None:
+            return {"ok": True, "data": cached, "cached": True}
+
+    try:
+        r = requests.get(url, params=params, timeout=20)
+        # podejrzyj limity
+        for k, v in r.headers.items():
+            lk = k.lower()
+            if lk.startswith("x-requests") or lk.startswith("x-remaining") or "limit" in lk:
+                _last_limits[lk] = v
+
+        r.raise_for_status()
+        data = r.json()
+        if cache_key:
+            _cache_set(cache_key, data)
+        return {"ok": True, "data": data}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 def implied(price: Optional[float]) -> Optional[float]:
-    """Konwersja kursu dziesiętnego na „fair” prawdopodobieństwo."""
     if not price or price <= 1.0:
         return None
     return 1.0 / price
 
 
 def normalize_3way(h, a, d):
-    """Normalizacja prawdopodobieństw (HOME/AWAY/DRAW) do 1."""
     probs = [p for p in (h, a, d) if p]
     s = sum(probs) or 1.0
     scale = (lambda x: (x / s) if x else None)
     return scale(h), scale(a), scale(d)
 
 
-def kelly_fraction(prob: float, price: float, cap: float = 0.25, fraction: float = 0.5) -> float:
+def kelly_fraction(prob: Optional[float], price: Optional[float],
+                   cap: float = 0.25, fraction: float = 0.5) -> float:
     """
     Kelly dla kursu dziesiętnego.
-    fraction=0.5 -> tzw. „half Kelly” (bezpieczniej),
-    cap=0.25 -> maksymalnie 25% banku na jeden zakład.
+    fraction=0.5 to „half Kelly”, cap – maksymalny % bankrolu na zakład.
     """
     if not prob or not price or price <= 1.0:
         return 0.0
@@ -80,31 +103,8 @@ def kelly_fraction(prob: float, price: float, cap: float = 0.25, fraction: float
     return min(k, cap)
 
 
-def fetch_json(url: str, params: dict, cache_key: Optional[str] = None) -> dict:
-    """GET z cache + zbieraniem nagłówków limitów. Zwraca {"ok":bool,"data":...|None,"error":str|None}"""
-    if cache_key:
-        cached = _cache_get(cache_key)
-        if cached is not None:
-            return {"ok": True, "data": cached, "cached": True}
-
-    try:
-        r = requests.get(url, params=params, timeout=20)
-        # zbierz nagłówki dot. limitów
-        for k, v in r.headers.items():
-            lk = k.lower()
-            if lk.startswith("x-requests") or "remaining" in lk or "limit" in lk:
-                _last_limits[lk] = v
-        r.raise_for_status()
-        data = r.json()
-        if cache_key:
-            _cache_set(cache_key, data)
-        return {"ok": True, "data": data}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-
-
 # -----------------------------
-# Modele (ładniej w Swaggerze)
+# Modele (dla ładnego Swaggera)
 # -----------------------------
 class Pick(BaseModel):
     match: str
@@ -113,11 +113,11 @@ class Pick(BaseModel):
     bookmaker: Optional[str] = None
     fair_prob: Optional[float] = None
     ev: Optional[float] = None
-    kelly: Optional[float] = None
-    stake: Optional[float] = None
     commence: Optional[str] = None
     league: Optional[str] = None
-    type: str  # "value" | "low_ev" | "no_prob" | "error"
+    type: str  # "value" | "low_ev" | "fallback"
+    kelly: float
+    stake: float
 
 
 # -----------------------------
@@ -161,46 +161,39 @@ def list_sports(all: bool = True):
 @app.get("/picks", response_model=List[Pick])
 def picks(
     sport: str = Query("soccer_epl", description="np. soccer_epl, soccer_poland_ekstraklasa, basketball_nba"),
-    region: str = Query("eu,uk", description="np. eu, uk, us, au (lub mieszane: eu,uk)"),
+    region: str = Query("eu,uk", description="np. eu, uk, us, au lub kombinacje: eu,uk"),
     min_ev: float = Query(0.03, ge=0.0, description="Minimalne EV, np. 0.03 = 3%"),
     limit: int = Query(20, ge=1, le=100),
     market: str = Query("h2h", description="Domyślnie h2h"),
-    bookmakers: Optional[str] = Query(None, description="Filtr: np. Unibet,Betfair"),
-    bankroll: float = Query(0.0, ge=0.0, description="Bankroll do stawki Kelly; 0 = nie licz stawki"),
-    kelly_fraction_param: float = Query(0.5, ge=0.1, le=1.0, description="Część Kelly (np. 0.5 = half Kelly)"),
-    kelly_cap: float = Query(0.25, ge=0.05, le=1.0, description="Maksymalna część banku na zakład")
+    bookmakers: Optional[str] = Query(None, description="Lista buków, np. Unibet,Betfair"),
+    bankroll: float = Query(0.0, ge=0.0, description="Bankrol do wyliczenia stawki"),
+    include_low_ev: bool = Query(True, description="Pokazuj też low_ev, gdy brak value"),
+    include_fallback: bool = Query(True, description="Pokazuj fallback, gdy brak sensownych kursów"),
 ):
     """
-    Zwraca:
-      - type="value" (EV ≥ min_ev) – value bety,
-      - type="low_ev" (EV < min_ev) – mamy fair_prob, ale próg nie spełniony,
-      - type="no_prob" – kursy są, ale nie dało się policzyć fair_prob (np. brak kompletu H/A/D).
-    Dla "value" i "low_ev" pokazujemy też Kelly/stake (jeśli bankroll>0).
+    1) liczymy EV i Kelly dla najlepszych kursów HOME/AWAY/DRAW,
+    2) value -> EV ≥ min_ev,
+    3) low_ev -> EV < min_ev (stawka=0, ale z kelly),
+    4) fallback -> gdy nie ma kompletu danych do EV.
     """
     if not ODDS_API_KEY:
-        return [Pick(match="ERROR", selection="", price=0, type="error")]
+        return []
 
     url = f"{BASE}/sports/{sport}/odds"
-    params = {
-        "apiKey": ODDS_API_KEY,
-        "regions": region,
-        "markets": market,
-        "oddsFormat": "decimal"
-    }
+    params = {"apiKey": ODDS_API_KEY, "regions": region, "markets": market, "oddsFormat": "decimal"}
 
     books_filter = None
     if bookmakers:
         books_filter = set([b.strip().lower() for b in bookmakers.split(",") if b.strip()])
 
-    ck = f"odds:{sport}:{region}:{market}"
-    res = fetch_json(url, params, cache_key=ck)
+    res = fetch_json(url, params, cache_key=f"odds:{sport}:{region}:{market}:{bookmakers or 'all'}")
     if not res["ok"]:
-        return [Pick(match=f"ERROR: {res['error']}", selection="", price=0, type="error")]
+        return []
 
     events = res["data"]
     values: List[Pick] = []
-    lows: List[Pick] = []
-    no_prob: List[Pick] = []
+    low_ev: List[Pick] = []
+    fallback: List[Pick] = []
 
     for ev in events:
         home = ev.get("home_team")
@@ -212,9 +205,10 @@ def picks(
         best_home_book = best_away_book = best_draw_book = None
 
         for b in ev.get("bookmakers", []):
-            bname = (b.get("title") or "")
+            bname = b.get("title") or ""
             if books_filter and bname.lower() not in books_filter:
                 continue
+
             for m in b.get("markets", []):
                 if m.get("key") != "h2h":
                     continue
@@ -229,75 +223,88 @@ def picks(
                     elif name == "Draw" and (not best_draw or price > best_draw):
                         best_draw, best_draw_book = price, bname
 
-        # policz fair_prob (jeśli możliwe)
+        # policz EV/kelly dla kandydatów
         h, a, d = implied(best_home), implied(best_away), implied(best_draw)
-        can_prob = any([h, a, d])
-        if can_prob:
+        has_any_price = any([best_home, best_away, best_draw])
+
+        if has_any_price:
+            # normalizacja tylko jeśli mamy jakieś prawdopodobieństwa
             h, a, d = normalize_3way(h, a, d)
 
-        # pomocnicza funkcja do budowy pozycji
-        def mk_pick(sel: str, price: Optional[float], prob: Optional[float], book: Optional[str]) -> Optional[Pick]:
-            if not price:
-                return None
-            kelly = None
-            stake = None
-            evv = None
-            if prob:
-                evv = prob * price - 1
-                kelly = kelly_fraction(prob, price, cap=kelly_cap, fraction=kelly_fraction_param)
-                if bankroll > 0:
-                    stake = round(kelly * bankroll, 2)
+            def mk(sel: str, price: Optional[float], prob: Optional[float],
+                   book: Optional[str]) -> Optional[Pick]:
+                if not price:
+                    return None
+                ev_val = None
+                kelly = 0.0
+                if prob:
+                    ev_val = prob * price - 1
+                    kelly = kelly_fraction(prob, price)
+                stake = round((bankroll * kelly), 2) if ev_val is not None and ev_val >= min_ev else 0.0
+                ptype = "value" if (ev_val is not None and ev_val >= min_ev) else "low_ev"
+                return Pick(
+                    match=f"{home} vs {away}",
+                    selection=sel,
+                    price=round(price, 3),
+                    bookmaker=book,
+                    fair_prob=round(prob, 3) if prob else None,
+                    ev=round(ev_val, 3) if ev_val is not None else None,
+                    commence=commence,
+                    league=league,
+                    type=ptype,
+                    kelly=round(kelly, 4),
+                    stake=stake
+                )
 
-            p = Pick(
-                match=f"{home} vs {away}",
-                selection=sel,
-                price=round(price, 3),
-                bookmaker=book,
-                fair_prob=round(prob, 3) if prob is not None else None,
-                ev=round(evv, 3) if evv is not None else None,
-                kelly=round(kelly, 4) if kelly is not None else None,
-                stake=stake,
-                commence=commence,
-                league=league,
-                type="value"  # tymczasowo; zaraz przypiszemy właściwy typ
-            )
-            if prob is None:
-                p.type = "no_prob"
-            elif p.ev is not None and p.ev >= min_ev:
-                p.type = "value"
-            else:
-                p.type = "low_ev"
-            return p
+            cands = [
+                mk("HOME", best_home, h, best_home_book),
+                mk("AWAY", best_away, a, best_away_book),
+                mk("DRAW", best_draw, d, best_draw_book),
+            ]
+            cands = [c for c in cands if c]
 
-        picks_for_event: List[Pick] = []
-        picks_for_event += [mk_pick("HOME", best_home, h if can_prob else None, best_home_book)]
-        picks_for_event += [mk_pick("AWAY", best_away, a if can_prob else None, best_away_book)]
-        picks_for_event += [mk_pick("DRAW", best_draw, d if can_prob else None, best_draw_book)]
-        picks_for_event = [p for p in picks_for_event if p]
+            # podziel na value / low_ev
+            for c in cands:
+                if c.type == "value":
+                    values.append(c)
+                elif include_low_ev:
+                    low_ev.append(c)
+        else:
+            # brak cen – fallback
+            if include_fallback:
+                for sel, price, book in (
+                    ("HOME", best_home, best_home_book),
+                    ("AWAY", best_away, best_away_book),
+                    ("DRAW", best_draw, best_draw_book),
+                ):
+                    if price:
+                        fallback.append(Pick(
+                            match=f"{home} vs {away}",
+                            selection=sel,
+                            price=round(price, 3),
+                            bookmaker=book,
+                            fair_prob=None,
+                            ev=None,
+                            commence=commence,
+                            league=league,
+                            type="fallback",
+                            kelly=0.0,
+                            stake=0.0
+                        ))
 
-        # rozdziel do kubełków
-        for p in picks_for_event:
-            if p.type == "value":
-                values.append(p)
-            elif p.type == "low_ev":
-                lows.append(p)
-            else:
-                no_prob.append(p)
+    # sortowanie
+    values.sort(key=lambda x: (-(x.ev or 0), x.commence or ""))
+    low_ev.sort(key=lambda x: (-(x.ev or -1e9), x.commence or ""))
+    fallback.sort(key=lambda x: (x.match, x.selection))
 
-    # sortowanie i ograniczenie
-    values.sort(key=lambda x: (-(x.ev or 0), x.commence or "", x.match))
-    lows.sort(key=lambda x: (-(x.ev or -1), x.commence or "", x.match))
-    no_prob.sort(key=lambda x: (x.match, x.selection))
-
-    out: List[Pick] = []
+    # logika zwrotu
     if values:
-        out = values[:limit]
-    elif lows:
-        out = lows[:limit]
-    else:
-        out = no_prob[:limit]
-
-    return out
+        return values[:limit]
+    if include_low_ev and low_ev:
+        return low_ev[:limit]
+    if include_fallback and fallback:
+        return fallback[:limit]
+    return []
 
 
 @app.get("/debug")
@@ -310,47 +317,27 @@ def debug(
         return {"error": "Brak ODDS_API_KEY"}
 
     url = f"{BASE}/sports/{sport}/odds"
-    params = {
-        "apiKey": ODDS_API_KEY,
-        "regions": region,
-        "markets": market,
-        "oddsFormat": "decimal"
-    }
+    params = {"apiKey": ODDS_API_KEY, "regions": region, "markets": market, "oddsFormat": "decimal"}
 
     res = fetch_json(url, params, cache_key=f"debug:{sport}:{region}:{market}")
     if not res["ok"]:
         return {"error": f"API error: {res['error']}"}
 
     events = res["data"]
-    total_events = len(events)
-    with_h2h = 0
     examples = []
-    example_books = []
-
-    for ev in events:
-        has = False
-        local_books = set()
+    for ev in events[:3]:
+        books = set()
         for b in ev.get("bookmakers", []):
-            btitle = b.get("title", "")
-            for m in b.get("markets", []):
-                if m.get("key") == "h2h" and m.get("outcomes"):
-                    has = True
-                    local_books.add(btitle)
-            # kontynuujemy, żeby zebrać pełną listę buków w przykładzie
-        if has:
-            with_h2h += 1
-            if len(examples) < 3:
-                examples.append({
-                    "match": f"{ev.get('home_team')} vs {ev.get('away_team')}",
-                    "bookmakers": sorted(list(local_books))
-                })
-        example_books.extend(list(local_books))
+            books.add(b.get("title", ""))
+        examples.append({
+            "match": f"{ev.get('home_team')} vs {ev.get('away_team')}",
+            "bookmakers": sorted([x for x in books if x]),
+        })
 
     return {
         "sport": sport,
         "region": region,
-        "events_from_api": total_events,
-        "events_with_h2h": with_h2h,
+        "events_from_api": len(events),
         "examples": examples,
         "rate_limit_headers": _last_limits,
     }
