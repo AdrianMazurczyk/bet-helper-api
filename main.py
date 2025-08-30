@@ -123,3 +123,18 @@ def picks(
 
     results.sort(key=lambda x: (-x["ev"], x["commence"] or ""))
     return results[:limit]
+@app.get("/sports")
+def list_sports(region: str = "eu"):
+    url = f"{BASE}/sports"
+    params = {"apiKey": ODDS_API_KEY, "all": "true"}
+    try:
+        r = requests.get(url, params=params, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+        # zwróć tylko najpotrzebniejsze pola
+        return [
+            {"key": s.get("key"), "title": s.get("title"), "active": s.get("active")}
+            for s in data
+        ]
+    except Exception as e:
+        return {"error": f"API error: {e}"}
