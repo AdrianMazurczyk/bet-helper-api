@@ -1,4 +1,5 @@
-from fastapi import FastAPI, Query, Response, HTTPException
+# main.py
+from fastapi import FastAPI, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Dict, Optional, Tuple
@@ -9,14 +10,14 @@ from datetime import datetime, timedelta, timezone
 import csv
 import io
 
-# =========================================================
+# -----------------------------------------------------------------------------
 # Konfiguracja
-# =========================================================
-app = FastAPI(title="Bet Helper", version="1.4.0")
+# -----------------------------------------------------------------------------
+app = FastAPI(title="Bet Helper", version="1.5.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # w produkcji ogranicz do swojej domeny
+    allow_origins=["*"],  # w produkcji wpisz domenę
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -25,28 +26,39 @@ app.add_middleware(
 ODDS_API_KEY = os.getenv("ODDS_API_KEY")
 BASE = "https://api.the-odds-api.com/v4"
 
-# prosty cache
+# Cache w pamięci
 CACHE_TTL_SECONDS = 60
 _cache: Dict[str, Tuple[float, dict]] = {}
 _last_limits: Dict[str, str] = {}
 
-# aliasy sportów (w UI możesz pisać "epl")
+# Popularne aliasy sportów (wygoda w UI)
 SPORT_ALIASES = {
+    # Piłka nożna
     "epl": "soccer_epl",
     "pl": "soccer_poland_ekstraklasa",
     "ekstraklasa": "soccer_poland_ekstraklasa",
+    "laliga": "soccer_spain_la_liga",
+    "seriea": "soccer_italy_serie_a",
+    "bundes": "soccer_germany_bundesliga",
+    "ucl": "soccer_uefa_champions_league",
+    # Koszykówka
     "nba": "basketball_nba",
+    # Hokej / baseball / american football
+    "nhl": "ice_hockey_nhl",
+    "mlb": "baseball_mlb",
+    "nfl": "americanfootball_nfl",
+    # Tenis
+    "tennis": "tennis_atp",
+    "atp": "tennis_atp",
+    "wta": "tennis_wta",
+    # Rugby
+    "rugby": "rugby_union",
+    "rugbyu": "rugby_union",
 }
 
-def normalize_sport_key(sport: str) -> str:
-    if not sport:
-        return "soccer_epl"
-    s = sport.strip().lower()
-    return SPORT_ALIASES.get(s, sport)
-
-# =========================================================
+# -----------------------------------------------------------------------------
 # Narzędzia
-# =========================================================
+# -----------------------------------------------------------------------------
 def _cache_get(key: str) -> Optional[dict]:
     now = time.time()
     item = _cache.get(key)
@@ -76,9 +88,9 @@ def kelly_fraction(prob: float, price: float, cap: float = 0.25, fraction: float
     """
     Kelly dla kursu dziesiętnego.
     prob: fair probability po normalizacji
-    price: kurs
+    price: kurs (decimal)
     fraction: 0.5 = half Kelly (bezpieczniej)
-    cap: maks. część banku na jeden zakład
+    cap: maks. część banku na zakład (np. 25%)
     """
     if not prob or not price or price <= 1.0:
         return 0.0
@@ -114,14 +126,18 @@ def fetch_json(url: str, params: dict, cache_key: Optional[str] = None) -> dict:
 
 def parse_iso(dt: str) -> Optional[datetime]:
     try:
-        # The Odds API zwraca UTC ISO
         return datetime.fromisoformat(dt.replace("Z", "+00:00"))
     except Exception:
         return None
 
-# =========================================================
+def smart_sport_key(s: str) -> str:
+    if not s:
+        return s
+    return SPORT_ALIASES.get(s.lower().strip(), s)
+
+# -----------------------------------------------------------------------------
 # Modele (dla ładnego Swaggera)
-# =========================================================
+# -----------------------------------------------------------------------------
 class Pick(BaseModel):
     match: str
     selection: str
@@ -133,11 +149,11 @@ class Pick(BaseModel):
     stake: Optional[float] = None
     commence: Optional[str] = None
     league: Optional[str] = None
-    type: str
+    type: str  # "value" | "low_ev"
 
-# =========================================================
-# Root / Status
-# =========================================================
+# -----------------------------------------------------------------------------
+# Endpointy bazowe
+# -----------------------------------------------------------------------------
 @app.get("/")
 def home():
     return {"message": "Bet Helper działa!"}
@@ -151,62 +167,49 @@ def status():
         "cache_size": len(_cache),
     }
 
-# =========================================================
-# Sports
-# =========================================================
 @app.get("/sports")
 def list_sports(all: bool = True):
     if not ODDS_API_KEY:
         return {"error": "Brak ODDS_API_KEY w środowisku."}
-
     url = f"{BASE}/sports"
     params = {"apiKey": ODDS_API_KEY}
     if all:
         params["all"] = "true"
-
     res = fetch_json(url, params, cache_key=f"sports:{all}")
     if not res["ok"]:
         return {"error": f"API error: {res['error']}"}
     data = res["data"]
     return [{"key": s.get("key"), "title": s.get("title"), "active": s.get("active")} for s in data]
 
-# =========================================================
-# Picks
-# =========================================================
+# -----------------------------------------------------------------------------
+# /picks – główne API z EV/Kelly/stake + CSV
+# -----------------------------------------------------------------------------
 @app.get("/picks", response_model=List[Pick])
 def picks(
-    sport: str = Query("soccer_epl", description="np. soccer_epl, epl (alias wspierany)"),
-    region: str = Query("eu,uk", description="np. eu, uk, us, au lub kombinacje: eu,uk"),
-    min_ev: float = Query(0.0, ge=0.0, description="Minimalne EV, np. 0.03 = 3%"),
-    limit: int = Query(200, ge=1, le=300),
-    market: str = Query("h2h", description="Domyślnie h2h"),
-    bookmakers: Optional[str] = Query(None, description="Lista buków przecinkiem, np. Unibet,Betfair"),
+    sport: str = Query("soccer_epl", description="np. soccer_epl, epl, soccer_poland_ekstraklasa, nba, atp"),
+    region: str = Query("eu,uk", description="np. eu, uk, us, au, kombinacje: eu,uk"),
+    min_ev: float = Query(0.03, ge=0.0, description="Minimalne EV, np. 0.03 = 3%"),
+    limit: int = Query(40, ge=1, le=400),
+    market: str = Query("h2h"),
+    bookmakers: Optional[str] = Query(None, description="CSV buków, np. Unibet,Betfair"),
     min_price: Optional[float] = Query(None, ge=1.0),
     max_price: Optional[float] = Query(None, ge=1.0),
     bankroll: float = Query(1000.0, ge=0.0),
     kelly_fraction_q: float = Query(0.5, ge=0.0, le=1.0, description="np. 0.5 = half Kelly"),
     kelly_cap: float = Query(0.25, ge=0.0, le=1.0),
-    commission: float = Query(0.0, ge=0.0, le=0.1, description="Prowizja bukm. (0–0.1)"),
-    show: str = Query("all", regex="^(value|all)$"),
+    commission: float = Query(0.0, ge=0.0, le=0.1, description="Prowizja (0–0.1)"),
+    show: str = Query("value", regex="^(value|all)$"),
     format: str = Query("json", regex="^(json|csv)$"),
-    stake_all: bool = Query(True, description="Jeśli True, pokazuj Kelly/stake również dla low_ev"),
+    stake_all: bool = Query(False, description="Jeśli True – pokazuj Kelly/stake także dla low_ev"),
     since_hours: int = Query(0, ge=0, description="Od teraz + Xh (filtr czasu)"),
     until_hours: int = Query(120, ge=1, description="Do teraz + Yh (filtr czasu)"),
 ):
-    """
-    Pobiera kursy H2H, wybiera najlepszy kurs HOME/AWAY/DRAW, normalizuje fair prob,
-    liczy EV (po prowizji), Kelly i proponowaną stawkę.
-    - show=value → tylko value-bety (EV ≥ min_ev)
-    - show=all   → value + low_ev
-    - format=csv → CSV zamiast JSON
-    - stake_all  → pokaż kelly/stake również dla low_ev
-    """
     if not ODDS_API_KEY:
-        return [{"match": "", "selection": "", "price": 0, "bookmaker": None, "fair_prob": None,
-                 "ev": None, "kelly": None, "stake": None, "commence": None, "league": None, "type": "error"}]
+        return [{"match": "", "selection": "", "price": 0, "bookmaker": None,
+                 "fair_prob": None, "ev": None, "kelly": None, "stake": None,
+                 "commence": None, "league": None, "type": "error"}]
 
-    sport = normalize_sport_key(sport)
-
+    sport = smart_sport_key(sport)
     url = f"{BASE}/sports/{sport}/odds"
     params = {
         "apiKey": ODDS_API_KEY,
@@ -228,8 +231,8 @@ def picks(
     res = fetch_json(url, params, cache_key=ck)
     if not res["ok"]:
         return [{"match": f"ERROR: {res['error']}", "selection": "", "price": 0, "bookmaker": None,
-                 "fair_prob": None, "ev": None, "kelly": None, "stake": None, "commence": None,
-                 "league": None, "type": "error"}]
+                 "fair_prob": None, "ev": None, "kelly": None, "stake": None,
+                 "commence": None, "league": None, "type": "error"}]
 
     events = res["data"]
     out_rows: List[Dict] = []
@@ -237,9 +240,8 @@ def picks(
     for ev in events:
         commence = ev.get("commence_time")
         commence_dt = parse_iso(commence)
-        if commence_dt:
-            if not (start_dt <= commence_dt <= end_dt):
-                continue
+        if commence_dt and not (start_dt <= commence_dt <= end_dt):
+            continue
 
         home = ev.get("home_team")
         away = ev.get("away_team")
@@ -248,7 +250,6 @@ def picks(
         best_home = best_away = best_draw = None
         best_home_book = best_away_book = best_draw_book = None
 
-        # wybór najlepszego kursu per wynik
         for b in ev.get("bookmakers", []):
             bname = b.get("title") or ""
             if books_filter and bname.lower() not in books_filter:
@@ -258,14 +259,11 @@ def picks(
                     continue
                 for o in m.get("outcomes", []):
                     name, price = o.get("name"), o.get("price")
-
-                    # filtr cen
                     if price:
                         if min_price is not None and price < min_price:
                             continue
                         if max_price is not None and price > max_price:
                             continue
-
                     if name == home and (not best_home or price > best_home):
                         best_home, best_home_book = price, bname
                     elif name == away and (not best_away or price > best_away):
@@ -273,7 +271,7 @@ def picks(
                     elif name == "Draw" and (not best_draw or price > best_draw):
                         best_draw, best_draw_book = price, bname
 
-        # policz fair i EV
+        # fair probs
         h, a, d = implied(best_home), implied(best_away), implied(best_draw)
         if any([h, a, d]):
             h, a, d = normalize_3way(h, a, d)
@@ -281,19 +279,14 @@ def picks(
         def build(sel: str, price: Optional[float], prob: Optional[float], book: Optional[str]) -> Optional[Dict]:
             if not price:
                 return None
-            # prowizja (np. 0.02 = 2%) obniża efektywny kurs
             eff_price = price * (1.0 - commission)
             ev_val = (prob * eff_price - 1.0) if prob else None
             kel = kelly_fraction(prob, eff_price, cap=kelly_cap, fraction=kelly_fraction_q) if prob else 0.0
-
             is_value = (ev_val is not None) and (ev_val >= min_ev)
             row_type = "value" if is_value else "low_ev"
-
-            # stake – zawsze licz, ale pokaż przy low_ev tylko gdy stake_all=True
-            stake_amt = round(kel * bankroll, 2) if kel and bankroll else 0.0
+            stake_amt = round(kel * bankroll, 2) if (kel and bankroll) else 0.0
             if not is_value and not stake_all:
                 stake_amt = 0.0
-
             return {
                 "match": f"{home} vs {away}",
                 "selection": sel,
@@ -320,17 +313,16 @@ def picks(
 
         out_rows.extend(cands)
 
-    # sortowanie: najpierw po typie (value > low_ev), potem EV desc, potem czas
+    # sort: value>low_ev, EV desc, czas rosnąco
     def sort_key(x: Dict):
         t = 1 if x["type"] == "value" else 0
-        ev_ = x["ev"] if x["ev"] is not None else -999
+        evv = x["ev"] if x["ev"] is not None else -999
         c = x["commence"] or ""
-        return (-t, -ev_, c)
+        return (-t, -evv, c)
 
     out_rows.sort(key=sort_key)
     out_rows = out_rows[:limit]
 
-    # CSV?
     if format == "csv":
         buf = io.StringIO()
         writer = csv.writer(buf)
@@ -346,9 +338,9 @@ def picks(
 
     return out_rows
 
-# =========================================================
-# Debug
-# =========================================================
+# -----------------------------------------------------------------------------
+# /debug – szybkie info
+# -----------------------------------------------------------------------------
 @app.get("/debug")
 def debug(
     sport: str = Query("soccer_epl"),
@@ -357,9 +349,7 @@ def debug(
 ):
     if not ODDS_API_KEY:
         return {"error": "Brak ODDS_API_KEY"}
-
-    sport = normalize_sport_key(sport)
-
+    sport = smart_sport_key(sport)
     url = f"{BASE}/sports/{sport}/odds"
     params = {
         "apiKey": ODDS_API_KEY,
@@ -367,7 +357,6 @@ def debug(
         "markets": market,
         "oddsFormat": "decimal"
     }
-
     res = fetch_json(url, params, cache_key=f"debug:{sport}:{region}:{market}")
     if not res["ok"]:
         return {"error": f"API error: {res['error']}"}
@@ -390,9 +379,8 @@ def debug(
             if len(examples) < 3:
                 examples.append({
                     "match": f"{ev.get('home_team')} vs {ev.get('away_team')}",
-                    "bookmakers": books[:25],
+                    "bookmakers": books[:30],
                 })
-
     return {
         "sport": sport,
         "region": region,
@@ -402,9 +390,113 @@ def debug(
         "rate_limit_headers": _last_limits,
     }
 
-# =========================================================
-# Dashboard /ui
-# =========================================================
+# -----------------------------------------------------------------------------
+# /match_summary – jeden mecz: HOME/DRAW/AWAY, has_draw dla 2-way
+# -----------------------------------------------------------------------------
+@app.get("/match_summary")
+def match_summary(
+    match: str = Query(..., description="format: 'HOME TEAM vs AWAY TEAM'"),
+    sport: str = Query("soccer_epl"),
+    region: str = Query("eu,uk"),
+    commission: float = Query(0.0, ge=0.0, le=0.1),
+):
+    if not ODDS_API_KEY:
+        return {"error": "Brak ODDS_API_KEY"}
+
+    sport = smart_sport_key(sport)
+    url = f"{BASE}/sports/{sport}/odds"
+    params = {
+        "apiKey": ODDS_API_KEY,
+        "regions": region,
+        "markets": "h2h",
+        "oddsFormat": "decimal"
+    }
+
+    res = fetch_json(url, params, cache_key=f"summary:{sport}:{region}:h2h")
+    if not res["ok"]:
+        return {"error": f"API error: {res['error']}"}
+
+    # parsowanie "Home vs Away"
+    if " vs " not in match:
+        return {"error": "Parametr 'match' musi być w formacie 'HOME vs AWAY'."}
+    expect_home, expect_away = [x.strip() for x in match.split(" vs ", 1)]
+
+    found_ev = None
+    for ev in res["data"]:
+        home = ev.get("home_team", "")
+        away = ev.get("away_team", "")
+        # dopasuj w obie strony (różne API potrafią różnie pisać)
+        if {home.lower(), away.lower()} == {expect_home.lower(), expect_away.lower()}:
+            found_ev = ev
+            break
+
+    if not found_ev:
+        return {"error": f"Nie znaleziono meczu '{match}' w {sport} ({region})."}
+
+    home = found_ev.get("home_team")
+    away = found_ev.get("away_team")
+    commence = found_ev.get("commence_time")
+    league = found_ev.get("sport_title", "")
+
+    best_home = best_away = best_draw = None
+    for b in found_ev.get("bookmakers", []):
+        for m in b.get("markets", []):
+            if m.get("key") != "h2h":
+                continue
+            for o in m.get("outcomes", []):
+                name, price = o.get("name"), o.get("price")
+                if not price:
+                    continue
+                if name == home and (not best_home or price > best_home):
+                    best_home = price
+                elif name == away and (not best_away or price > best_away):
+                    best_away = price
+                elif name == "Draw" and (not best_draw or price > best_draw):
+                    best_draw = price
+
+    # implied & normalize
+    h, a, d = implied(best_home), implied(best_away), implied(best_draw)
+    if any([h, a, d]):
+        h, a, d = normalize_3way(h, a, d)
+
+    # has_draw: jeśli nie ma sensownego kursu na remis – to 2-way
+    has_draw = best_draw is not None and d is not None
+
+    # rekomendacja: wybierz najwyższe prawdopodobieństwo
+    probs = {
+        "HOME": h or 0.0,
+        "AWAY": a or 0.0,
+    }
+    if has_draw:
+        probs["DRAW"] = d or 0.0
+
+    best_pick = max(probs.items(), key=lambda x: x[1])
+    pick_name, pick_prob = best_pick[0], best_pick[1]
+
+    return {
+        "match": f"{home} vs {away}",
+        "league": league,
+        "start": commence,
+        "has_draw": has_draw,
+        "probabilities": {
+            "HOME": round((h or 0.0) * 100, 1),
+            "DRAW": round((d or 0.0) * 100, 1) if has_draw else None,
+            "AWAY": round((a or 0.0) * 100, 1),
+        },
+        "raw_prices": {
+            "HOME": best_home,
+            "DRAW": best_draw if has_draw else None,
+            "AWAY": best_away,
+        },
+        "recommendation": {
+            "pick": pick_name,
+            "confidence_percent": round(pick_prob * 100, 1),
+        }
+    }
+
+# -----------------------------------------------------------------------------
+# /ui – dashboard
+# -----------------------------------------------------------------------------
 @app.get("/ui")
 def ui():
     html = """
@@ -415,17 +507,17 @@ def ui():
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
 <title>Bet Helper – Dashboard</title>
 <style>
-:root{--bg:#0f1220;--card:#171a2b;--text:#e9ecf1;--muted:#9aa3b2;--green:#27c28a;--gray:#2a2f45;--red:#f87171;}
-*{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--text);font:14px/1.4 system-ui, -apple-system, Segoe UI, Roboto, Ubuntu}
+:root{--bg:#0f1220;--card:#171a2b;--text:#e9ecf1;--muted:#9aa3b2;--green:#27c28a;--gray:#2a2f45;--red:#f87171;--amber:#f59e0b;--btn:#4251f5;}
+*{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,Ubuntu}
 .wrap{max-width:1100px;margin:32px auto;padding:0 16px}
 h1{margin:0 0 16px 0;font-size:22px}
 .card{background:var(--card);border-radius:14px;padding:16px;margin-bottom:16px;box-shadow:0 6px 20px rgba(0,0,0,.25)}
 .row{display:flex;gap:8px;flex-wrap:wrap}
 input,select{background:#0e1120;border:1px solid #2b324d;color:var(--text);border-radius:10px;padding:10px 12px;outline:none}
-button{background:#4251f5;border:none;color:#fff;border-radius:10px;padding:10px 14px;cursor:pointer}
+button{background:var(--btn);border:none;color:#fff;border-radius:10px;padding:10px 14px;cursor:pointer}
 button.ghost{background:#252a43}
 .badge{padding:4px 8px;border-radius:999px;font-size:12px}
-.badge.value{background:rgba(39,194,138,.16);color:#27c28a}
+.badge.value{background:rgba(39,194,138,.18);color:#27c28a}
 .badge.low{background:var(--gray);color:#c9d2e3}
 table{width:100%;border-collapse:collapse}
 th,td{padding:10px;border-bottom:1px solid #22263b;text-align:left;vertical-align:top}
@@ -434,7 +526,7 @@ small{color:var(--muted)}
 .k{white-space:nowrap}
 .right{text-align:right}
 .footer{display:flex;gap:12px;align-items:center;justify-content:space-between}
-a.btn{color:#fff;text-decoration:none;background:#2b355a;padding:6px 10px;border-radius:8px}
+a.link{color:#8ab4ff;text-decoration:none}
 </style>
 </head>
 <body>
@@ -443,15 +535,15 @@ a.btn{color:#fff;text-decoration:none;background:#2b355a;padding:6px 10px;border
 
   <div class="card">
     <div class="row">
-      <label>Sport<br><input id="sport" value="epl"/></label>
+      <label>Sport<br><input id="sport" value="epl" placeholder="np. epl, nba, atp"/></label>
       <label>Region<br><input id="region" value="eu,uk"/></label>
       <label>Show<br>
         <select id="show">
-          <option value="all" selected>all</option>
-          <option value="value">value</option>
+          <option value="value" selected>value</option>
+          <option value="all">all</option>
         </select>
       </label>
-      <label>Min EV<br><input id="min_ev" type="number" step="0.001" value="0"/></label>
+      <label>Min EV<br><input id="min_ev" type="number" step="0.001" value="0.02"/></label>
       <label>Bankroll<br><input id="bankroll" type="number" step="1" value="1000"/></label>
       <label>Bookmakers (CSV)<br><input id="books" placeholder="np. Unibet,Betfair"/></label>
       <label>Min price<br><input id="min_price" type="number" step="0.01" placeholder=""/></label>
@@ -460,7 +552,7 @@ a.btn{color:#fff;text-decoration:none;background:#2b355a;padding:6px 10px;border
       <label>Until h<br><input id="until" type="number" value="120"/></label>
       <label>Commission<br><input id="comm" type="number" step="0.005" value="0.00"/></label>
       <label>Stake all<br>
-        <select id="stake_all"><option value="true">true</option><option value="false">false</option></select>
+        <select id="stake_all"><option value="false">false</option><option value="true">true</option></select>
       </label>
     </div>
     <div style="margin-top:10px" class="row">
@@ -478,16 +570,27 @@ a.btn{color:#fff;text-decoration:none;background:#2b355a;padding:6px 10px;border
           <tr>
             <th>Mecz</th><th>Pick</th><th class="right">Kurs</th><th>Buk</th>
             <th class="right">Fair</th><th class="right">EV</th><th class="right">Kelly</th><th class="right">Stake</th>
-            <th>Start</th><th>Typ</th><th>Compare</th>
+            <th>Start</th><th>Typ</th>
           </tr>
         </thead>
         <tbody></tbody>
       </table>
     </div>
   </div>
+
+  <div class="card">
+    <div class="footer">
+      <b>Dual view (HOME vs AWAY, DRAW zawsze żółty)</b>
+      <small id="dual_meta"></small>
+    </div>
+    <div id="dual"></div>
+  </div>
 </div>
 
 <script>
+const col = {HOME:'#22c55e', DRAW:'#f59e0b', AWAY:'#ef4444'};
+function pct(x){ return x!=null ? (x*100).toFixed(1)+'%' : ''; }
+
 async function loadPicks(){
   const q = new URLSearchParams();
   q.set('sport', document.getElementById('sport').value);
@@ -521,21 +624,8 @@ async function loadPicks(){
       const stake = (r.stake||0).toFixed(2);
       sumStake += parseFloat(stake)||0;
 
-      // link Compare -> /ui_match z uzupełnionymi parametrami
-      const parts = (r.match||'').split(' vs ');
-      const home = parts[0]||''; const away = parts[1]||'';
-      const u = new URLSearchParams();
-      u.set('sport', document.getElementById('sport').value);
-      u.set('region', document.getElementById('region').value);
-      u.set('home', home); u.set('away', away);
-      const books = document.getElementById('books').value.trim();
-      if(books) u.set('bookmakers', books);
-      const comm = document.getElementById('comm').value || '0';
-      u.set('commission', comm);
-      const compareLink = '/ui_match#'+u.toString();
-
       tr.innerHTML = `
-        <td><div>${r.match}</div><small>${r.league||''}</small></td>
+        <td><div><a class="link" href="/ui_match?match=${encodeURIComponent(r.match)}&sport=${encodeURIComponent(document.getElementById('sport').value)}&region=${encodeURIComponent(document.getElementById('region').value)}" target="_blank">${r.match}</a></div><small>${r.league||''}</small></td>
         <td>${r.selection}</td>
         <td class="right k">${r.price?.toFixed ? r.price.toFixed(2) : r.price}</td>
         <td>${r.bookmaker||''}</td>
@@ -545,12 +635,40 @@ async function loadPicks(){
         <td class="right">${stake}</td>
         <td>${r.commence ? new Date(r.commence).toLocaleString() : ''}</td>
         <td>${badge}</td>
-        <td><a class="btn" href="${compareLink}" target="_blank">🔍 Compare</a></td>
       `;
       tb.appendChild(tr);
     });
     document.getElementById('sumStake').innerText = sumStake.toFixed(2);
     document.getElementById('meta').innerText = `Łącznie: ${data.length} pozycji`;
+
+    // Dual view (agregacja po meczu)
+    const byMatch = {};
+    data.forEach(r=>{
+      if(!byMatch[r.match]) byMatch[r.match] = {league:r.league, start:r.commence, HOME:null, DRAW:null, AWAY:null};
+      byMatch[r.match][r.selection] = r.fair_prob;
+    });
+    const rows = Object.entries(byMatch).map(([m,v])=>({match:m, ...v}));
+    rows.sort((a,b)=> (a.start||'').localeCompare(b.start||''));
+
+    const wrap = document.getElementById('dual');
+    wrap.innerHTML = '';
+    rows.forEach(r=>{
+      const home = r.HOME!=null ? (r.HOME*100).toFixed(1)+'%' : '';
+      const draw = r.DRAW!=null ? (r.DRAW*100).toFixed(1)+'%' : '';
+      const away = r.AWAY!=null ? (r.AWAY*100).toFixed(1)+'%' : '';
+      const div = document.createElement('div');
+      div.style.margin = '8px 0';
+      div.innerHTML = `
+        <div><b>${r.match}</b> <small>${r.league||''} • ${r.start? new Date(r.start).toLocaleString():''}</small></div>
+        <div style="display:flex;gap:6px;margin-top:6px">
+          <span style="background:${col.HOME};color:#07110b;padding:4px 8px;border-radius:8px">HOME ${home}</span>
+          ${r.DRAW!=null ? `<span style="background:${col.DRAW};color:#201300;padding:4px 8px;border-radius:8px">DRAW ${draw}</span>` : ''}
+          <span style="background:${col.AWAY};color:#200707;padding:4px 8px;border-radius:8px">AWAY ${away}</span>
+        </div>
+      `;
+      wrap.appendChild(div);
+    });
+    document.getElementById('dual_meta').innerText = `Mecze: ${rows.length}`;
   }catch(e){
     document.getElementById('meta').innerText = 'Błąd: ' + e;
   }
@@ -582,237 +700,74 @@ loadPicks();
     """.strip()
     return Response(content=html, media_type="text/html")
 
-# =========================================================
-# MATCH SUMMARY – proste zestawienie jednego meczu (JSON)
-# =========================================================
-def _find_event_by_teams(events, home_q: str, away_q: str):
-    """Znajdź event po 'zawiera' (case-insensitive) nazwach drużyn."""
-    hq = (home_q or "").casefold()
-    aq = (away_q or "").casefold()
-    best = None
-    for ev in events:
-        home = (ev.get("home_team") or "").casefold()
-        away = (ev.get("away_team") or "").casefold()
-        if hq and aq and (hq in home and aq in away):
-            return ev
-        # fallback: pasuj wg dowolnej kolejności
-        if hq and aq and (hq in away and aq in home):
-            return ev
-        # zapamiętaj częściowe trafienie (na wypadek literówek)
-        if (hq and hq in home) or (aq and aq in away) or (hq and hq in away) or (aq and aq in home):
-            best = best or ev
-    return best
-
-@app.get("/match_summary")
-def match_summary(
-    sport: str = Query("soccer_epl", description="np. soccer_epl / epl alias"),
-    region: str = Query("eu,uk"),
-    home: str = Query(..., description="Nazwa gospodarzy (fragment)"),
-    away: str = Query(..., description="Nazwa gości (fragment)"),
-    bookmakers: Optional[str] = Query(None, description="CSV, np. Unibet,Betfair"),
-    commission: float = Query(0.0, ge=0.0, le=0.1),
-):
-    """
-    Zwraca prosty podgląd 1 meczu: procenty HOME / DRAW / AWAY + rekomendacja.
-    """
-    if not ODDS_API_KEY:
-        raise HTTPException(status_code=500, detail="Brak ODDS_API_KEY")
-
-    sport = normalize_sport_key(sport)
-
-    # pobierz kursy
-    url = f"{BASE}/sports/{sport}/odds"
-    params = {"apiKey": ODDS_API_KEY, "regions": region, "markets": "h2h", "oddsFormat": "decimal"}
-    res = fetch_json(url, params, cache_key=f"summary:{sport}:{region}:h2h")
-    if not res["ok"]:
-        raise HTTPException(status_code=502, detail=f"API error: {res['error']}")
-
-    events = res["data"]
-    ev = _find_event_by_teams(events, home, away)
-    if not ev:
-        raise HTTPException(status_code=404, detail="Nie znaleziono meczu. Sprawdź nazwy.")
-
-    H = ev.get("home_team"); A = ev.get("away_team")
-    league = ev.get("sport_title", "")
-    start = ev.get("commence_time")
-
-    # filtry buków
-    books_filter = None
-    if bookmakers:
-        books_filter = set([b.strip().lower() for b in bookmakers.split(",") if b.strip()])
-
-    best_home = best_away = best_draw = None
-    best_home_book = best_away_book = best_draw_book = None
-
-    for b in ev.get("bookmakers", []):
-        bname = b.get("title") or ""
-        if books_filter and bname.lower() not in books_filter:
-            continue
-        for m in b.get("markets", []):
-            if m.get("key") != "h2h":
-                continue
-            for o in m.get("outcomes", []):
-                name, price = o.get("name"), o.get("price")
-                if not price:
-                    continue
-                if name == H and (not best_home or price > best_home):
-                    best_home, best_home_book = price, bname
-                elif name == A and (not best_away or price > best_away):
-                    best_away, best_away_book = price, bname
-                elif name == "Draw" and (not best_draw or price > best_draw):
-                    best_draw, best_draw_book = price, bname
-
-    # implied & normalizacja
-    h, a, d = implied(best_home), implied(best_away), implied(best_draw)
-    if any([h, a, d]):
-        h, a, d = normalize_3way(h, a, d)
-
-    # kurs efektywny po prowizji (tylko do informacji)
-    def eff(p): return round(p * (1.0 - commission), 3) if p else None
-
-    probs = {
-        "HOME": round((h or 0.0) * 100, 1),
-        "DRAW": round((d or 0.0) * 100, 1),
-        "AWAY": round((a or 0.0) * 100, 1),
-    }
-    prices = {
-        "HOME": best_home, "DRAW": best_draw, "AWAY": best_away,
-        "HOME_eff": eff(best_home), "DRAW_eff": eff(best_draw), "AWAY_eff": eff(best_away),
-    }
-    books = {"HOME": best_home_book, "DRAW": best_draw_book, "AWAY": best_away_book}
-
-    # rekomendacja: porównujemy tylko HOME vs AWAY (remis zawsze żółty)
-    ha = [("HOME", h or 0.0), ("AWAY", a or 0.0)]
-    winner = max(ha, key=lambda x: x[1])[0]
-    loser  = "HOME" if winner == "AWAY" else "AWAY"
-
-    return {
-        "match": f"{H} vs {A}",
-        "league": league,
-        "start": start,
-        "probs_percent": probs,            # np. {"HOME": 52.1, "DRAW": 24.7, "AWAY": 23.2}
-        "prices": prices,                  # kursy + kursy po prowizji
-        "bookmakers": books,               # skąd kurs
-        "colors": {                        # jakie kolory w UI
-            "HOME": "green" if winner == "HOME" else ("red" if loser == "HOME" else "yellow"),
-            "DRAW": "yellow",
-            "AWAY": "green" if winner == "AWAY" else ("red" if loser == "AWAY" else "yellow"),
-        },
-        "recommendation": {                # jasno: na co grać
-            "pick": winner,
-            "confidence_percent": round(max(h or 0.0, a or 0.0)*100, 1)
-        }
-    }
-
-# =========================================================
-# UI dla jednego meczu
-# =========================================================
+# -----------------------------------------------------------------------------
+# /ui_match – widok pojedynczego meczu (zielony/czerwony/żółty)
+# -----------------------------------------------------------------------------
 @app.get("/ui_match")
-def ui_match():
-    html = """
+def ui_match(
+    match: str = Query(..., description="HOME vs AWAY"),
+    sport: str = Query("epl"),
+    region: str = Query("eu,uk")
+):
+    html = f"""
 <!doctype html>
 <html lang="pl">
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>Match Summary</title>
+<title>Bet Helper – Match View</title>
 <style>
-:root{--bg:#0f1220;--card:#171a2b;--text:#e9ecf1;--muted:#9aa3b2;--green:#27c28a;--red:#f87171;--yellow:#f5c84a;}
-body{margin:0;background:var(--bg);color:var(--text);font:14px/1.4 system-ui,-apple-system,Segoe UI,Roboto}
-.wrap{max-width:820px;margin:28px auto;padding:0 16px}
-.card{background:var(--card);border-radius:14px;padding:16px;box-shadow:0 6px 20px rgba(0,0,0,.25)}
-.row{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}
-input{background:#0e1120;border:1px solid #2b324d;color:var(--text);border-radius:10px;padding:10px 12px;outline:none}
-button{background:#4251f5;border:none;color:#fff;border-radius:10px;padding:10px 14px;cursor:pointer}
-h2{margin:0 0 8px 0}
-.badge{padding:4px 8px;border-radius:999px;font-size:12px}
-.green{background:rgba(39,194,138,.16);color:#27c28a}
-.red{background:rgba(248,113,113,.16);color:#f87171}
-.yellow{background:rgba(245,200,74,.18);color:#f5c84a}
-.bar{height:12px;border-radius:8px;background:#202542}
-.bar>span{display:block;height:12px;border-radius:8px}
-.label{width:72px;display:inline-block}
-small{color:var(--muted)}
+:root{{--bg:#0f1220;--card:#171a2b;--text:#e9ecf1;--muted:#9aa3b2;--green:#22c55e;--red:#ef4444;--amber:#f59e0b;}}
+*{{box-sizing:border-box}} body{{margin:0;background:var(--bg);color:var(--text);font:16px/1.5 system-ui,-apple-system,Segoe UI,Roboto,Ubuntu}}
+.wrap{{max-width:900px;margin:28px auto;padding:0 16px}}
+.card{{background:var(--card);border-radius:14px;padding:18px;box-shadow:0 10px 30px rgba(0,0,0,.32)}}
+h1{{font-size:22px;margin:0 0 12px}}
+small{{color:var(--muted)}}
+.bar{{height:42px;border-radius:10px;margin:6px 0;display:flex;align-items:center;justify-content:space-between;padding:0 12px;font-weight:600}}
+.bar.home{{background:rgba(34,197,94,.18);color:#8af0ba;border:1px solid rgba(34,197,94,.35)}}
+.bar.draw{{background:rgba(245,158,11,.18);color:#ffd18c;border:1px solid rgba(245,158,11,.35)}}
+.bar.away{{background:rgba(239,68,68,.18);color:#ff9d9d;border:1px solid rgba(239,68,68,.35)}}
+.badge{{padding:4px 8px;border-radius:999px;font-size:12px;background:#2a314c;color:#d4d9ea}}
 </style>
 </head>
 <body>
 <div class="wrap">
   <div class="card">
-    <div class="row">
-      <input id="sport" value="soccer_epl" style="width:160px" placeholder="sport"/>
-      <input id="region" value="eu,uk" style="width:120px" placeholder="region"/>
-      <input id="home" placeholder="Home (fragment)"/>
-      <input id="away" placeholder="Away (fragment)"/>
-      <input id="books" placeholder="np. Unibet,Betfair"/>
-      <input id="comm" type="number" step="0.005" value="0" style="width:90px" placeholder="commission"/>
-      <button onclick="go()">Pokaż</button>
-    </div>
-    <div id="out"><small>Wpisz nazwy drużyn i kliknij Pokaż. Możesz też przejść tu z linku „🔍 Compare” w /ui.</small></div>
+    <h1>Match view</h1>
+    <small id="meta">Ładowanie…</small>
+    <div id="out" style="margin-top:14px"></div>
   </div>
 </div>
-
 <script>
-function color(c){return c==='green'?'green':(c==='red'?'red':'yellow');}
-
-// jeśli przyszliśmy z /ui przez hash, wczytaj parametry
-(function preset(){
-  if(location.hash && location.hash.length>1){
-    const p = new URLSearchParams(location.hash.slice(1));
-    if(p.get('sport')) document.getElementById('sport').value = p.get('sport');
-    if(p.get('region')) document.getElementById('region').value = p.get('region');
-    if(p.get('home')) document.getElementById('home').value = p.get('home');
-    if(p.get('away')) document.getElementById('away').value = p.get('away');
-    if(p.get('bookmakers')) document.getElementById('books').value = p.get('bookmakers');
-    if(p.get('commission')) document.getElementById('comm').value = p.get('commission');
-    setTimeout(go, 50);
-  }
-})();
-
-function go(){
-  const q=new URLSearchParams();
-  q.set('sport',document.getElementById('sport').value||'soccer_epl');
-  q.set('region',document.getElementById('region').value||'eu,uk');
-  q.set('home',document.getElementById('home').value||'');
-  q.set('away',document.getElementById('away').value||'');
-  const b=document.getElementById('books').value.trim(); if(b) q.set('bookmakers',b);
-  const c=document.getElementById('comm').value||'0'; q.set('commission',c);
-  fetch('/match_summary?'+q.toString()).then(r=>{
-    if(!r.ok) throw new Error('HTTP '+r.status);
-    return r.json();
-  }).then(data=>{
-    const p=data.probs_percent;
-    const col=data.colors;
-    const prices=data.prices;
-    const books=data.bookmakers;
-
-    const mkBar=(lab,val,c)=>{
-      const w=Math.max(1, Math.min(100, val));
-      const cls=color(c);
-      return `
-        <div style="margin:10px 0">
-          <div class="label">${lab}</div>
-          <div class="bar"><span style="width:${w}%; background: var(--${cls});"></span></div>
-          <div style="display:flex; gap:12px; align-items:center; margin-top:4px">
-            <span class="badge ${cls}">${val.toFixed(1)}%</span>
-            <small>Kurs: ${prices[lab]?.toFixed ? prices[lab].toFixed(2) : (prices[lab]||'-')} (${books[lab]||'-'})</small>
-          </div>
-        </div>`;
-    };
-
-    document.getElementById('out').innerHTML = `
-      <h2>${data.match}</h2>
-      <small>${data.league||''} • ${data.start ? new Date(data.start).toLocaleString() : ''}</small>
-      <div style="margin-top:12px"></div>
-      ${mkBar('HOME', p.HOME, col.HOME)}
-      ${mkBar('DRAW', p.DRAW, col.DRAW)}
-      ${mkBar('AWAY', p.AWAY, col.AWAY)}
-      <div style="margin-top:8px"><b>Rekomendacja:</b> <span class="badge green">${data.recommendation.pick}</span>
-      <small>(pewność ${data.recommendation.confidence_percent.toFixed(1)}%)</small></div>
-    `;
-  }).catch(e=>{
-    document.getElementById('out').innerHTML = '<small style="color:#f87171">Błąd: '+e+'</small>';
-  });
+function mkBar(label, p, cls){ 
+  const val = (p!=null)? p.toFixed(1)+'%' : '';
+  return `<div class="bar ${cls}"><span>${label}</span><span>${val}</span></div>`;
 }
+(async ()=>{
+  const q = new URLSearchParams({match: {match!r}, sport: {sport!r}, region: {region!r}});
+  const res = await fetch('/match_summary?' + q.toString());
+  const data = await res.json();
+  const m = document.getElementById('meta');
+  if(data.error){{ m.innerText = data.error; return; }}
+  m.innerText = `${{data.league||''}} • ${{data.start? new Date(data.start).toLocaleString():''}}`;
+
+  const p = data.probabilities || {{}};
+  const hasDraw = !!data.has_draw;
+  const blocks = [
+    mkBar('HOME', p.HOME, 'home'),
+    hasDraw ? mkBar('DRAW', p.DRAW, 'draw') : '',
+    mkBar('AWAY', p.AWAY, 'away'),
+  ].join('');
+  document.getElementById('out').innerHTML = `
+    <h2>${{data.match}}</h2>
+    <div style="height:8px"></div>
+    ${blocks}
+    <div style="margin-top:10px"><b>Rekomendacja:</b>
+      <span class="badge">${{data.recommendation.pick}}</span>
+      <small>(pewność ${{data.recommendation.confidence_percent.toFixed(1)}}%)</small>
+    </div>
+  `;
+}})();
 </script>
 </body>
 </html>
