@@ -9,9 +9,9 @@ from datetime import datetime, timedelta, timezone
 import csv
 import io
 
-# ======================================
+# -----------------------------
 # Konfiguracja
-# ======================================
+# -----------------------------
 app = FastAPI(title="Bet Helper", version="1.4.0")
 
 app.add_middleware(
@@ -30,24 +30,30 @@ CACHE_TTL_SECONDS = 60
 _cache: Dict[str, Tuple[float, dict]] = {}
 _last_limits: Dict[str, str] = {}
 
-# Proste aliasy sportów (żeby wpisywać krócej)
-SPORT_ALIASES: Dict[str, str] = {
+# Proste aliasy sportów (żeby można było pisać epl, ekstraklasa, itd.)
+SPORT_ALIASES = {
     "epl": "soccer_epl",
-    "prem": "soccer_epl",
-    "premier_league": "soccer_epl",
     "ekstraklasa": "soccer_poland_ekstraklasa",
     "pl": "soccer_poland_ekstraklasa",
-    "poland": "soccer_poland_ekstraklasa",
-    "nba": "basketball_nba",
     "laliga": "soccer_spain_la_liga",
+    "la_liga": "soccer_spain_la_liga",
+    "serie_a": "soccer_italy_serie_a",
     "bundesliga": "soccer_germany_bundesliga",
-    "seriea": "soccer_italy_serie_a",
     "ligue1": "soccer_france_ligue_one",
+    "ucl": "soccer_uefa_champs_league",
+    "nba": "basketball_nba",
 }
 
-# ======================================
+def resolve_sport(s: str) -> str:
+    if not s:
+        return s
+    key = s.strip().lower()
+    return SPORT_ALIASES.get(key, s)
+
+
+# -----------------------------
 # Narzędzia
-# ======================================
+# -----------------------------
 def _cache_get(key: str) -> Optional[dict]:
     now = time.time()
     item = _cache.get(key)
@@ -74,7 +80,13 @@ def normalize_3way(h, a, d):
     return scale(h), scale(a), scale(d)
 
 def kelly_fraction(prob: float, price: float, cap: float = 0.25, fraction: float = 0.5) -> float:
-    """Kelly dla kursu dziesiętnego (decimal)."""
+    """
+    Kelly dla kursu dziesiętnego.
+    prob: fair probability po normalizacji
+    price: kurs
+    fraction: 0.5 = half Kelly (bezpieczniej)
+    cap: maks. część banku na jeden zakład
+    """
     if not prob or not price or price <= 1.0:
         return 0.0
     b = price - 1.0
@@ -109,17 +121,15 @@ def fetch_json(url: str, params: dict, cache_key: Optional[str] = None) -> dict:
 
 def parse_iso(dt: str) -> Optional[datetime]:
     try:
+        # The Odds API zwraca UTC ISO
         return datetime.fromisoformat(dt.replace("Z", "+00:00"))
     except Exception:
         return None
 
-def normalize_sport_key(s: str) -> str:
-    key = (s or "").strip().lower()
-    return SPORT_ALIASES.get(key, s)
 
-# ======================================
-# Modele (Swagger)
-# ======================================
+# -----------------------------
+# Modele (dla ładnego Swaggera)
+# -----------------------------
 class Pick(BaseModel):
     match: str
     selection: str
@@ -133,78 +143,40 @@ class Pick(BaseModel):
     league: Optional[str] = None
     type: str
 
-# ======================================
-# Endpointy
-# ======================================
-@app.get("/")
-def home():
-    return {"message": "Bet Helper działa!"}
 
-@app.get("/status")
-def status():
-    return {
-        "ok": True,
-        "have_api_key": bool(ODDS_API_KEY),
-        "rate_limit_headers": _last_limits,
-        "cache_size": len(_cache),
-    }
-
-@app.get("/sports")
-def list_sports(all: bool = True):
-    if not ODDS_API_KEY:
-        return {"error": "Brak ODDS_API_KEY w środowisku Railway (Shared Variables)."}
-
-    url = f"{BASE}/sports"
-    params = {"apiKey": ODDS_API_KEY}
-    if all:
-        params["all"] = "true"
-
-    res = fetch_json(url, params, cache_key=f"sports:{all}")
-    if not res["ok"]:
-        return {"error": f"API error: {res['error']}"}
-    data = res["data"]
-    return [{"key": s.get("key"), "title": s.get("title"), "active": s.get("active")} for s in data]
-
-@app.get("/picks", response_model=List[Pick])
-def picks(
-    sport: str = Query("soccer_epl", description="np. soccer_epl / alias: epl, nba, ekstraklasa"),
-    region: str = Query("eu,uk", description="np. eu, uk, us, au lub kombinacje: eu,uk"),
-    min_ev: float = Query(0.0, ge=0.0, description="Minimalne EV (0 = pokaż wszystko)"),
-    limit: int = Query(200, ge=1, le=300),
-    market: str = Query("h2h", description="Domyślnie h2h"),
-    bookmakers: Optional[str] = Query(None, description="Lista buków przecinkiem, np. Unibet,Betfair"),
-    min_price: Optional[float] = Query(None, ge=1.0),
-    max_price: Optional[float] = Query(None, ge=1.0),
-    bankroll: float = Query(1000.0, ge=0.0),
-    kelly_fraction_q: float = Query(0.5, ge=0.0, le=1.0, description="np. 0.5 = half Kelly"),
-    kelly_cap: float = Query(0.25, ge=0.0, le=1.0),
-    commission: float = Query(0.0, ge=0.0, le=0.1, description="Prowizja bukm. (0–0.1)"),
-    show: str = Query("all", regex="^(value|all)$"),
-    format: str = Query("json", regex="^(json|csv)$"),
-    stake_all: bool = Query(True, description="Pokazuj stawki także dla low_ev"),
-    since_hours: int = Query(0, ge=0, description="Od teraz + Xh (filtr czasu)"),
-    until_hours: int = Query(120, ge=1, description="Do teraz + Yh (filtr czasu)"),
-):
+# -----------------------------
+# Wspólna logika zbierania typów
+# -----------------------------
+def collect_picks_rows(
+    sport: str,
+    region: str,
+    market: str,
+    bookmakers: Optional[str],
+    min_price: Optional[float],
+    max_price: Optional[float],
+    commission: float,
+    since_hours: int,
+    until_hours: int,
+    min_ev: float,
+    show: str,
+    bankroll: float,
+    kelly_fraction_q: float,
+    kelly_cap: float,
+    stake_all: bool,
+) -> List[Dict]:
     """
-    Pobiera kursy H2H, wybiera najlepszy kurs HOME/AWAY/DRAW, normalizuje fair prob,
-    liczy EV (po prowizji), Kelly i proponowaną stawkę.
-    - show=value → tylko value-bety (EV ≥ min_ev)
-    - show=all   → value + low_ev
-    - format=csv → CSV zamiast JSON
-    - stake_all  → pokaż kelly/stake również dla low_ev
+    Zwraca listę wierszy picków (dict) jak w /picks, żeby można było
+    użyć też w /accas. Nie ucina limitu – caller tnie/sortuje.
     """
     if not ODDS_API_KEY:
-        return [{"match": "", "selection": "", "price": 0, "bookmaker": None, "fair_prob": None,
-                 "ev": None, "kelly": None, "stake": None, "commence": None, "league": None, "type": "error"}]
-
-    sport = normalize_sport_key(sport)
+        return []
 
     url = f"{BASE}/sports/{sport}/odds"
     params = {
         "apiKey": ODDS_API_KEY,
         "regions": region,
         "markets": market,
-        "oddsFormat": "decimal"
+        "oddsFormat": "decimal",
     }
 
     books_filter = None
@@ -219,9 +191,7 @@ def picks(
     ck = f"odds:{sport}:{region}:{market}"
     res = fetch_json(url, params, cache_key=ck)
     if not res["ok"]:
-        return [{"match": f"ERROR: {res['error']}", "selection": "", "price": 0, "bookmaker": None,
-                 "fair_prob": None, "ev": None, "kelly": None, "stake": None, "commence": None,
-                 "league": None, "type": "error"}]
+        return []
 
     events = res["data"]
     out_rows: List[Dict] = []
@@ -278,14 +248,12 @@ def picks(
             kel = kelly_fraction(prob, eff_price, cap=kelly_cap, fraction=kelly_fraction_q) if prob else 0.0
             is_value = (ev_val is not None) and (ev_val >= min_ev)
             row_type = "value" if is_value else "low_ev"
-
-            # stake – zawsze licz, ale przy low_ev pokazuj tylko gdy stake_all=True
             stake_amt = round(kel * bankroll, 2) if kel and bankroll else 0.0
             if not is_value and not stake_all:
                 stake_amt = 0.0
-
             return {
                 "match": f"{home} vs {away}",
+                "event_id": f"{home}||{away}",
                 "selection": sel,
                 "price": round(price, 3),
                 "bookmaker": book,
@@ -310,22 +278,98 @@ def picks(
 
         out_rows.extend(cands)
 
-    # sortowanie: value > low_ev, EV desc, start asc
+    return out_rows
+
+
+# -----------------------------
+# Endpointy
+# -----------------------------
+@app.get("/")
+def home():
+    return {"message": "Bet Helper działa!"}
+
+@app.get("/status")
+def status():
+    return {
+        "ok": True,
+        "have_api_key": bool(ODDS_API_KEY),
+        "rate_limit_headers": _last_limits,
+        "cache_size": len(_cache),
+    }
+
+@app.get("/sports")
+def list_sports(all: bool = True):
+    if not ODDS_API_KEY:
+        return {"error": "Brak ODDS_API_KEY w środowisku Railway (Shared Variables)."}
+
+    url = f"{BASE}/sports"
+    params = {"apiKey": ODDS_API_KEY}
+    if all:
+        params["all"] = "true"
+
+    res = fetch_json(url, params, cache_key=f"sports:{all}")
+    if not res["ok"]:
+        return {"error": f"API error: {res['error']}"}
+    data = res["data"]
+    return [{"key": s.get("key"), "title": s.get("title"), "active": s.get("active")} for s in data]
+
+@app.get("/picks", response_model=List[Pick])
+def picks(
+    sport: str = Query("soccer_epl", description="np. soccer_epl lub alias: epl"),
+    region: str = Query("eu,uk", description="np. eu, uk, us, au lub kombinacje: eu,uk"),
+    min_ev: float = Query(0.03, ge=0.0, description="Minimalne EV, np. 0.03 = 3%"),
+    limit: int = Query(20, ge=1, le=200),
+    market: str = Query("h2h", description="Domyślnie h2h"),
+    bookmakers: Optional[str] = Query(None, description="Lista buków przecinkiem, np. Unibet,Betfair"),
+    min_price: Optional[float] = Query(None, ge=1.0),
+    max_price: Optional[float] = Query(None, ge=1.0),
+    bankroll: float = Query(1000.0, ge=0.0),
+    kelly_fraction_q: float = Query(0.5, ge=0.0, le=1.0, description="np. 0.5 = half Kelly (bezpieczniej)"),
+    kelly_cap: float = Query(0.25, ge=0.0, le=1.0),
+    commission: float = Query(0.0, ge=0.0, le=0.1, description="Prowizja bukm. (0–0.1)"),
+    show: str = Query("value", regex="^(value|all)$"),
+    format: str = Query("json", regex="^(json|csv)$"),
+    stake_all: bool = Query(False, description="Jeśli True, pokazuj Kelly/stake również dla low_ev"),
+    since_hours: int = Query(0, ge=0, description="Od teraz + Xh (filtr czasu)"),
+    until_hours: int = Query(72, ge=1, description="Do teraz + Yh (filtr czasu)"),
+):
+    """
+    Pobiera kursy H2H, wybiera najlepszy kurs HOME/AWAY/DRAW, normalizuje fair prob,
+    liczy EV (po prowizji), Kelly i proponowaną stawkę.
+    - show=value → tylko value-bety (EV ≥ min_ev)
+    - show=all   → value + low_ev
+    - format=csv → CSV zamiast JSON
+    - stake_all  → pokaż kelly/stake również dla low_ev
+    """
+    sport = resolve_sport(sport)
+
+    rows = collect_picks_rows(
+        sport=sport, region=region, market=market,
+        bookmakers=bookmakers, min_price=min_price, max_price=max_price,
+        commission=commission, since_hours=since_hours, until_hours=until_hours,
+        min_ev=min_ev, show=show, bankroll=bankroll,
+        kelly_fraction_q=kelly_fraction_q, kelly_cap=kelly_cap, stake_all=stake_all
+    )
+
+    # sortowanie: value > low_ev, EV desc, czas
     def sort_key(x: Dict):
         t = 1 if x["type"] == "value" else 0
-        ev = x["ev"] if x["ev"] is not None else -999
+        evv = x["ev"] if x["ev"] is not None else -999
         c = x["commence"] or ""
-        return (-t, -ev, c)
+        return (-t, -evv, c)
 
-    out_rows.sort(key=sort_key)
-    out_rows = out_rows[:limit]
+    rows.sort(key=sort_key)
+    rows = rows[:limit]
 
     # CSV?
     if format == "csv":
         buf = io.StringIO()
         writer = csv.writer(buf)
-        writer.writerow(["match", "selection", "price", "bookmaker", "fair_prob", "ev", "kelly", "stake", "commence", "league", "type"])
-        for r in out_rows:
+        writer.writerow(
+            ["match", "selection", "price", "bookmaker", "fair_prob",
+             "ev", "kelly", "stake", "commence", "league", "type"]
+        )
+        for r in rows:
             writer.writerow([
                 r.get("match"), r.get("selection"), r.get("price"), r.get("bookmaker"),
                 r.get("fair_prob"), r.get("ev"), r.get("kelly"), r.get("stake"),
@@ -334,18 +378,112 @@ def picks(
         csv_bytes = buf.getvalue().encode("utf-8")
         return Response(content=csv_bytes, media_type="text/csv")
 
-    return out_rows
+    return rows
+
+
+@app.get("/accas")
+def accas(
+    sport: str = Query("soccer_epl"),
+    region: str = Query("eu,uk"),
+    min_ev: float = Query(0.0, ge=0.0),
+    show: str = Query("all", regex="^(value|all)$"),
+    market: str = Query("h2h"),
+    bookmakers: Optional[str] = Query(None),
+    min_price: Optional[float] = Query(None, ge=1.0),
+    max_price: Optional[float] = Query(None, ge=1.0),
+    commission: float = Query(0.0, ge=0.0, le=0.1),
+    since_hours: int = Query(0, ge=0),
+    until_hours: int = Query(120, ge=1),
+    bankroll: float = Query(0.0, ge=0.0),           # nie używamy w acca
+    kelly_fraction_q: float = Query(0.5, ge=0.0, le=1.0),
+    kelly_cap: float = Query(0.25, ge=0.0, le=1.0),
+    stake_all: bool = Query(True),
+    min_legs: int = Query(2, ge=1),
+    max_legs: int = Query(10, ge=1, le=15),
+    limit_candidates: int = Query(60, ge=5, le=150),
+    stake: float = Query(2.0, ge=0.0, description="Kwota na jeden kupon"),
+):
+    """
+    Buduje przykładowe kupony o NAJWIĘKSZYM PRAWDOPODOBIEŃSTWIE:
+    dla L nóg bierze po prostu top-L meczów (po fair_prob) – 1 pick z meczu.
+
+    Zwraca 1 kupon na każdą długość od min_legs do max_legs (jeśli wystarczy meczów).
+    """
+    sport = resolve_sport(sport)
+
+    rows = collect_picks_rows(
+        sport=sport, region=region, market=market,
+        bookmakers=bookmakers, min_price=min_price, max_price=max_price,
+        commission=commission, since_hours=since_hours, until_hours=until_hours,
+        min_ev=min_ev, show=show, bankroll=bankroll,
+        kelly_fraction_q=kelly_fraction_q, kelly_cap=kelly_cap, stake_all=stake_all
+    )
+
+    # wybieramy 1 najlepszy pick na mecz (największe fair_prob)
+    best_per_match: Dict[str, Dict] = {}
+    for r in rows:
+        prob = r.get("fair_prob") or 0.0
+        eid = r.get("event_id")
+        if not eid or prob <= 0:
+            continue
+        prev = best_per_match.get(eid)
+        if (prev is None) or (prob > (prev.get("fair_prob") or 0.0)):
+            best_per_match[eid] = r
+
+    cands = list(best_per_match.values())
+    # sort po prawdopodobieństwie malejąco – to maksymalizuje iloczyn
+    cands.sort(key=lambda x: x.get("fair_prob") or 0.0, reverse=True)
+    cands = cands[:limit_candidates]
+
+    out = []
+    for L in range(min_legs, max_legs + 1):
+        if len(cands) < L:
+            continue
+        picks_L = cands[:L]
+        prob_total = 1.0
+        odds_total = 1.0
+        for p in picks_L:
+            prob_total *= float(p.get("fair_prob") or 0.0)
+            odds_total *= float(p.get("price") or 1.0)
+
+        ev_rel = prob_total * odds_total - 1.0
+        payout = round(odds_total * stake, 2)
+        ev_cash = round(stake * ev_rel, 2)
+
+        out.append({
+            "legs": L,
+            "prob": round(prob_total, 6),
+            "prob_pct": round(prob_total * 100.0, 2),
+            "odds": round(odds_total, 3),
+            "stake": round(stake, 2),
+            "payout": payout,
+            "ev_rel": round(ev_rel, 4),
+            "ev_cash": ev_cash,
+            "picks": [{
+                "match": p["match"],
+                "selection": p["selection"],
+                "price": p["price"],
+                "bookmaker": p["bookmaker"],
+                "fair_prob": p["fair_prob"],
+                "ev": p["ev"],
+                "commence": p["commence"],
+            } for p in picks_L],
+        })
+
+    return out
+
 
 @app.get("/debug")
 def debug(
-    sport: str = Query("soccer_epl"),
+    sport: str = Query("soccer_poland_ekstraklasa"),
     region: str = Query("eu,uk"),
     market: str = Query("h2h")
 ):
     if not ODDS_API_KEY:
         return {"error": "Brak ODDS_API_KEY"}
 
-    sport = normalize_sport_key(sport)
+    sport = resolve_sport(sport)
+
     url = f"{BASE}/sports/{sport}/odds"
     params = {
         "apiKey": ODDS_API_KEY,
@@ -376,7 +514,7 @@ def debug(
             if len(examples) < 3:
                 examples.append({
                     "match": f"{ev.get('home_team')} vs {ev.get('away_team')}",
-                    "bookmakers": books[:25],
+                    "bookmakers": books[:25],  # krótko
                 })
 
     return {
@@ -388,9 +526,10 @@ def debug(
         "rate_limit_headers": _last_limits,
     }
 
-# ======================================
+
+# -----------------------------
 # Prosty dashboard /ui
-# ======================================
+# -----------------------------
 @app.get("/ui")
 def ui():
     html = """
@@ -401,14 +540,14 @@ def ui():
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
 <title>Bet Helper – Dashboard</title>
 <style>
-:root{--bg:#0f1220;--card:#171a2b;--text:#e9ecf1;--muted:#9aa3b2;--green:#27c28a;--gray:#2a2f45;--red:#f87171;}
+:root{--bg:#0f1220;--card:#171a2b;--text:#e9ecf1;--muted:#9aa3b2;--green:#27c28a;--gray:#2a2f45;--red:#f87171;--blue:#4251f5}
 *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--text);font:14px/1.4 system-ui, -apple-system, Segoe UI, Roboto, Ubuntu}
 .wrap{max-width:1100px;margin:32px auto;padding:0 16px}
 h1{margin:0 0 16px 0;font-size:22px}
 .card{background:var(--card);border-radius:14px;padding:16px;margin-bottom:16px;box-shadow:0 6px 20px rgba(0,0,0,.25)}
 .row{display:flex;gap:8px;flex-wrap:wrap}
 input,select{background:#0e1120;border:1px solid #2b324d;color:var(--text);border-radius:10px;padding:10px 12px;outline:none}
-button{background:#4251f5;border:none;color:#fff;border-radius:10px;padding:10px 14px;cursor:pointer}
+button{background:var(--blue);border:none;color:#fff;border-radius:10px;padding:10px 14px;cursor:pointer}
 button.ghost{background:#252a43}
 .badge{padding:4px 8px;border-radius:999px;font-size:12px}
 .badge.value{background:rgba(39,194,138,.16);color:#27c28a}
@@ -420,6 +559,8 @@ small{color:var(--muted)}
 .k{white-space:nowrap}
 .right{text-align:right}
 .footer{display:flex;gap:12px;align-items:center;justify-content:space-between}
+.code{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace}
+blockquote{margin:8px 0 0 0;color:#cbd3e6}
 </style>
 </head>
 <body>
@@ -428,12 +569,12 @@ small{color:var(--muted)}
 
   <div class="card">
     <div class="row">
-      <label>Sport<br><input id="sport" value="soccer_epl" placeholder="np. epl, nba, ekstraklasa"/></label>
+      <label>Sport<br><input id="sport" value="epl"/></label>
       <label>Region<br><input id="region" value="eu,uk"/></label>
       <label>Show<br>
         <select id="show">
-          <option value="all" selected>all</option>
           <option value="value">value</option>
+          <option value="all" selected>all</option>
         </select>
       </label>
       <label>Min EV<br><input id="min_ev" type="number" step="0.001" value="0"/></label>
@@ -443,9 +584,9 @@ small{color:var(--muted)}
       <label>Max price<br><input id="max_price" type="number" step="0.01" placeholder=""/></label>
       <label>Since h<br><input id="since" type="number" value="0"/></label>
       <label>Until h<br><input id="until" type="number" value="120"/></label>
-      <label>Commission<br><input id="comm" type="number" step="0.005" value="0"/></label>
+      <label>Commission<br><input id="comm" type="number" step="0.005" value="0.00"/></label>
       <label>Stake all<br>
-        <select id="stake_all"><option value="true" selected>true</option><option value="false">false</option></select>
+        <select id="stake_all"><option value="false">false</option><option value="true" selected>true</option></select>
       </label>
     </div>
     <div style="margin-top:10px" class="row">
@@ -470,6 +611,33 @@ small{color:var(--muted)}
       </table>
     </div>
   </div>
+
+  <div class="card">
+    <div class="row">
+      <label>Acca min legs<br><input id="acca_min" type="number" value="2"/></label>
+      <label>Acca max legs<br><input id="acca_max" type="number" value="10"/></label>
+      <label>Stake per acca<br><input id="acca_stake" type="number" step="0.5" value="2"/></label>
+      <label>Limit candidates<br><input id="acca_lim" type="number" value="60"/></label>
+    </div>
+    <div style="margin-top:10px" class="row">
+      <button onclick="buildAccas()">Build accas</button>
+      <small id="accameta"></small>
+    </div>
+
+    <div style="overflow:auto;margin-top:8px">
+      <table id="accatbl">
+        <thead>
+          <tr>
+            <th>Legs</th><th class="right">Prob</th><th class="right">Kurs</th>
+            <th class="right">Stake</th><th class="right">Payout</th><th class="right">EV (cash)</th><th>Details</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <blockquote>Acca builder wybiera <span class="code">top-L</span> meczów wg najwyższego <b>Fair</b> (1 pick na mecz) – to <b>maksymalizuje prawdopodobieństwo</b> kuponu.</blockquote>
+  </div>
+
 </div>
 
 <script>
@@ -544,6 +712,52 @@ function exportCSV(){
   q.set('format','csv');
   q.set('limit','200');
   window.location = '/picks?' + q.toString();
+}
+
+async function buildAccas(){
+  const q = new URLSearchParams();
+  q.set('sport', document.getElementById('sport').value);
+  q.set('region', document.getElementById('region').value);
+  q.set('show', document.getElementById('show').value);
+  q.set('min_ev', document.getElementById('min_ev').value || '0');
+  const books = document.getElementById('books').value.trim();
+  if(books) q.set('bookmakers', books);
+  const minp = document.getElementById('min_price').value; if(minp) q.set('min_price', minp);
+  const maxp = document.getElementById('max_price').value; if(maxp) q.set('max_price', maxp);
+  q.set('since_hours', document.getElementById('since').value || '0');
+  q.set('until_hours', document.getElementById('until').value || '120');
+  q.set('commission', document.getElementById('comm').value || '0');
+  q.set('stake_all', document.getElementById('stake_all').value);
+
+  q.set('min_legs', document.getElementById('acca_min').value || '2');
+  q.set('max_legs', document.getElementById('acca_max').value || '10');
+  q.set('stake', document.getElementById('acca_stake').value || '2');
+  q.set('limit_candidates', document.getElementById('acca_lim').value || '60');
+
+  document.getElementById('accameta').innerText = 'Building…';
+  try{
+    const res = await fetch('/accas?' + q.toString());
+    const data = await res.json();
+    const tb = document.querySelector('#accatbl tbody');
+    tb.innerHTML = '';
+    data.forEach(a=>{
+      const tr = document.createElement('tr');
+      const picksHtml = a.picks.map(p => `${p.match} — <b>${p.selection}</b> @ ${p.price} <small>(${(p.fair_prob*100).toFixed(1)}%)</small>`).join('<br>');
+      tr.innerHTML = `
+        <td>${a.legs}</td>
+        <td class="right">${a.prob_pct.toFixed(2)}%</td>
+        <td class="right">${a.odds.toFixed ? a.odds.toFixed(2) : a.odds}</td>
+        <td class="right">${a.stake.toFixed ? a.stake.toFixed(2) : a.stake}</td>
+        <td class="right">${a.payout.toFixed ? a.payout.toFixed(2) : a.payout}</td>
+        <td class="right">${a.ev_cash.toFixed ? a.ev_cash.toFixed(2) : a.ev_cash}</td>
+        <td>${picksHtml}</td>
+      `;
+      tb.appendChild(tr);
+    });
+    document.getElementById('accameta').innerText = `Zbudowano: ${data.length} kuponów`;
+  }catch(e){
+    document.getElementById('accameta').innerText = 'Błąd: ' + e;
+  }
 }
 
 loadPicks();
